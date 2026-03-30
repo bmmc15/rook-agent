@@ -47,17 +47,7 @@ class Agent:
         logger.info("Starting agent...")
 
         # Connect to OpenClaw if available
-        if self.openclaw_client:
-            try:
-                await self.openclaw_client.connect()
-                await self.openclaw_streaming.start()
-
-                await self.event_bus.publish(
-                    Event(type=EventType.AGENT_CONNECTED, data={})
-                )
-
-            except Exception as e:
-                logger.warning(f"Could not connect to OpenClaw: {e}")
+        await self.ensure_openclaw_connected()
 
         self._running = True
         logger.info("Agent started")
@@ -81,6 +71,27 @@ class Agent:
 
         self._running = False
         logger.info("Agent stopped")
+
+    async def ensure_openclaw_connected(self) -> bool:
+        """Ensure OpenClaw is connected, retrying on demand when needed."""
+        if not self.openclaw_client:
+            return False
+
+        if self.openclaw_client.is_connected:
+            return True
+
+        try:
+            await self.openclaw_client.connect()
+            if self.openclaw_streaming:
+                await self.openclaw_streaming.start()
+
+            await self.event_bus.publish(
+                Event(type=EventType.AGENT_CONNECTED, data={})
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"Could not connect to OpenClaw: {e}")
+            return False
 
     async def process_message(self, content: str) -> str:
         """Process a user message.

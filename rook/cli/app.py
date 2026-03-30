@@ -87,6 +87,12 @@ class RookApp:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_requested_at: Optional[float] = None
         self._shutdown_signal_count = 0
+        self._voice_turn_mode = "idle"
+        self._openclaw_reply_future: Optional[asyncio.Future] = None
+        self._openclaw_reply_text = ""
+        self._openclaw_run_id: Optional[str] = None
+        self._voice_session_resetting = False
+        self._thinking_debug_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         """Start the application."""
@@ -107,6 +113,8 @@ class RookApp:
 
             self.event_bus.subscribe(EventType.AUDIO_INPUT_STARTED, self._on_audio_input_started)
             self.event_bus.subscribe(EventType.AUDIO_INPUT_STOPPED, self._on_audio_input_stopped)
+            self.event_bus.subscribe(EventType.AGENT_MESSAGE_RECEIVED, self._on_agent_message_received)
+            self.event_bus.subscribe(EventType.TASK_PROGRESS, self._on_task_progress)
 
             # Start audio capture
             try:
@@ -160,6 +168,7 @@ class RookApp:
 
         try:
             self._cancel_response_timeout()
+            self._cancel_thinking_debug()
 
             # Publish shutdown event
             await self.event_bus.publish(Event(type=EventType.SYSTEM_SHUTDOWN, data={}))
@@ -190,6 +199,8 @@ class RookApp:
 
             self.event_bus.unsubscribe(EventType.AUDIO_INPUT_STARTED, self._on_audio_input_started)
             self.event_bus.unsubscribe(EventType.AUDIO_INPUT_STOPPED, self._on_audio_input_stopped)
+            self.event_bus.unsubscribe(EventType.AGENT_MESSAGE_RECEIVED, self._on_agent_message_received)
+            self.event_bus.unsubscribe(EventType.TASK_PROGRESS, self._on_task_progress)
 
             await self.agent.stop()
 
@@ -279,6 +290,13 @@ class RookApp:
         self._agent_playback_started = False
         self._turn_audio_chunks = 0
         self._turn_audio_bytes = 0
+        self._voice_turn_mode = "transcribing_user"
+        self._openclaw_reply_text = ""
+        self._openclaw_run_id = None
+        self._cancel_thinking_debug()
+        if self._openclaw_reply_future and not self._openclaw_reply_future.done():
+            self._openclaw_reply_future.cancel()
+        self._openclaw_reply_future = None
         if self._response_timeout_task and not self._response_timeout_task.done():
             self._response_timeout_task.cancel()
         self.renderer.clear_transcripts()
@@ -304,7 +322,7 @@ class RookApp:
         await self.event_bus.publish(
             Event(type=EventType.STATE_CHANGED, data={"state": AppState.PROCESSING})
         )
-        self.renderer.update_hint("Thinking...")
+        self.renderer.update_hint("Transcribing...")
         await self.voice_provider.end_audio()
         self._response_timeout_task = self.create_task(self._response_timeout_watchdog())
 
@@ -323,11 +341,14 @@ class RookApp:
         """Handle a translated voice provider event."""
         if voice_event.type == VoiceEventType.CONNECTED:
             self.logger.info("Voice provider connected event received")
-            self.renderer.update_hint("Gemini Live connected")
+            self.renderer.update_hint("Voice connected")
             return
 
         if voice_event.type == VoiceEventType.DISCONNECTED:
             self.logger.info("Voice provider disconnected event received")
+            if self._voice_session_resetting:
+                self.logger.info("Ignoring voice disconnect during intentional session reset")
+                return
             if self.state_machine.current_state != AppState.IDLE:
                 self.renderer.update_hint("Gemini disconnected. Press Space to retry.")
                 self.state_machine.transition_to(AppState.IDLE, force=True)
@@ -360,18 +381,21 @@ class RookApp:
                 )
                 self.renderer.update_user_transcript(self._latest_user_transcript)
             elif source == "output":
-                self._pending_agent_transcript = self._merge_agent_transcript(
-                    self._pending_agent_transcript,
-                    raw_text,
-                    is_final=is_final,
-                )
-                if self._agent_playback_started:
-                    self._latest_agent_transcript = self._pending_agent_transcript
-                    self.renderer.update_agent_transcript(self._latest_agent_transcript)
+                if self._voice_turn_mode == "tts_speaking" and not self._pending_agent_transcript:
+                    self._pending_agent_transcript = self._merge_agent_transcript(
+                        self._pending_agent_transcript,
+                        raw_text,
+                        is_final=is_final,
+                    )
+                    if self._agent_playback_started:
+                        self._latest_agent_transcript = self._pending_agent_transcript
+                        self.renderer.update_agent_transcript(self._latest_agent_transcript)
             return
 
         if voice_event.type == VoiceEventType.AUDIO_DATA:
             self._cancel_response_timeout()
+            if self._voice_turn_mode != "tts_speaking":
+                return
             self._assistant_audio_buffer.extend(voice_event.data["audio"])
             self._assistant_audio_mime_type = voice_event.data.get(
                 "mime_type",
@@ -386,42 +410,49 @@ class RookApp:
 
         if voice_event.type == VoiceEventType.TURN_COMPLETE:
             self._cancel_response_timeout()
-            self.logger.info(
-                "Gemini turn completed with %s buffered reply bytes",
-                len(self._assistant_audio_buffer),
-            )
-            if self._assistant_audio_buffer:
-                if self._pending_agent_transcript:
-                    self._latest_agent_transcript = self._pending_agent_transcript
-                    self.renderer.update_agent_transcript(self._latest_agent_transcript)
+            if self._voice_turn_mode == "transcribing_user":
+                self.logger.info("Gemini transcription turn complete; routing to OpenClaw")
+                # The Gemini receive loop may need to be restarted for TTS, so keep the
+                # full OpenClaw->TTS handoff off this receive task to avoid self-await cycles.
+                self.create_task(self._request_openclaw_reply(self._latest_user_transcript.strip()))
+                return
 
-                # Pause microphone capture during playback to reduce device interference.
-                if self.audio_capture.is_running:
-                    await self.audio_capture.stop()
-
-                await self.event_bus.publish(Event(type=EventType.AUDIO_OUTPUT_STARTED, data={}))
-                playback_task = asyncio.create_task(
-                    self.audio_playback.play(
-                        bytes(self._assistant_audio_buffer),
-                        mime_type=self._assistant_audio_mime_type,
-                        on_start=self._on_playback_started,
-                        on_chunk=self._on_playback_chunk,
-                    )
+            if self._voice_turn_mode == "tts_speaking":
+                self.logger.info(
+                    "Gemini TTS turn completed with %s buffered reply bytes",
+                    len(self._assistant_audio_buffer),
                 )
-                await playback_task
-                await self.event_bus.publish(Event(type=EventType.AUDIO_OUTPUT_STOPPED, data={}))
-                self._assistant_audio_buffer.clear()
-                self._agent_playback_started = False
-                self.renderer.update_orb_activity(0.0)
+                if self._assistant_audio_buffer:
+                    if self._pending_agent_transcript:
+                        self._latest_agent_transcript = self._pending_agent_transcript
 
-                if not self.audio_capture.is_running:
-                    await self.audio_capture.start()
+                    if self.audio_capture.is_running:
+                        await self.audio_capture.stop()
 
-            self.state_machine.transition_to(AppState.IDLE, force=True)
-            await self.event_bus.publish(
-                Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
-            )
-            self.renderer.update_hint("Press Space to talk")
+                    await self.event_bus.publish(Event(type=EventType.AUDIO_OUTPUT_STARTED, data={}))
+                    playback_task = asyncio.create_task(
+                        self.audio_playback.play(
+                            bytes(self._assistant_audio_buffer),
+                            mime_type=self._assistant_audio_mime_type,
+                            on_start=self._on_playback_started,
+                            on_chunk=self._on_playback_chunk,
+                        )
+                    )
+                    await playback_task
+                    await self.event_bus.publish(Event(type=EventType.AUDIO_OUTPUT_STOPPED, data={}))
+                    self._assistant_audio_buffer.clear()
+                    self._agent_playback_started = False
+                    self.renderer.update_orb_activity(0.0)
+
+                    if not self.audio_capture.is_running:
+                        await self.audio_capture.start()
+
+                self._voice_turn_mode = "idle"
+                self.state_machine.transition_to(AppState.IDLE, force=True)
+                await self.event_bus.publish(
+                    Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
+                )
+                self.renderer.update_hint("Press Space to talk")
 
     def _chunk_to_pcm16(self, audio_chunk) -> bytes:
         """Convert a float32 numpy chunk into PCM16 bytes for Gemini."""
@@ -608,6 +639,8 @@ class RookApp:
         self._pending_agent_transcript = ""
         self._latest_agent_transcript = ""
         self._latest_user_transcript = text
+        self._openclaw_reply_text = ""
+        self._voice_turn_mode = "awaiting_openclaw"
         self.renderer.clear_transcripts()
         self.renderer.update_user_transcript(text)
 
@@ -618,14 +651,40 @@ class RookApp:
         await self.event_bus.publish(
             Event(type=EventType.STATE_CHANGED, data={"state": AppState.PROCESSING})
         )
-        self.renderer.update_hint("Thinking...")
-        await self.voice_provider.send_text(text)
-        self._response_timeout_task = self.create_task(self._response_timeout_watchdog())
+        self.renderer.update_hint("Rook is thinking...")
+        self.create_task(self._request_openclaw_reply(text))
 
-    async def _ensure_voice_session(self) -> bool:
+    async def _ensure_voice_session(self, force_reconnect: bool = False) -> bool:
         """Ensure there is an active Gemini session and receiver task."""
         if not self.voice_provider:
             return False
+
+        current_task = asyncio.current_task()
+        self.logger.info(
+            "Ensuring Gemini session (force_reconnect=%s, connected=%s, receive_task=%s)",
+            force_reconnect,
+            self.voice_provider.is_connected,
+            self._voice_receive_task is not None and not self._voice_receive_task.done(),
+        )
+
+        if force_reconnect:
+            self.logger.info("Restarting Gemini voice session")
+            self._voice_session_resetting = True
+            try:
+                if self.voice_provider.is_connected:
+                    await self.voice_provider.disconnect()
+                if self._voice_receive_task is not None:
+                    if self._voice_receive_task is current_task:
+                        # Force reconnect can be requested from code that was originally
+                        # triggered by the receive loop; never await the current task here.
+                        self.logger.warning(
+                            "Skipping await on current Gemini receive task during force reconnect"
+                        )
+                    else:
+                        await asyncio.gather(self._voice_receive_task, return_exceptions=True)
+                    self._voice_receive_task = None
+            finally:
+                self._voice_session_resetting = False
 
         if self._voice_receive_task and self._voice_receive_task.done():
             self._voice_receive_task = None
@@ -643,6 +702,230 @@ class RookApp:
         self._voice_receive_task = self.create_task(self._receive_voice_events())
         self.logger.info("Started Gemini receive loop")
         return True
+
+    async def _request_openclaw_reply(self, text: str) -> None:
+        """Send the transcribed/typed text to OpenClaw and wait for the final reply."""
+        text = text.strip()
+        if not text:
+            self._voice_turn_mode = "idle"
+            self.state_machine.transition_to(AppState.IDLE, force=True)
+            await self.event_bus.publish(
+                Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
+            )
+            self.renderer.update_hint("I didn't catch that. Press Space to try again.")
+            return
+
+        self.logger.info(
+            "Starting OpenClaw reply request for %s chars of user text: %r",
+            len(text),
+            text[:160],
+        )
+
+        if not await self.agent.ensure_openclaw_connected():
+            self.logger.warning("OpenClaw is not connected; falling back to Gemini text reply")
+            self._voice_turn_mode = "tts_speaking"
+            self._pending_agent_transcript = "OpenClaw is not connected."
+            self.renderer.update_hint("OpenClaw is not connected")
+            await self.voice_provider.send_text(
+                "Say exactly this text and nothing else: OpenClaw is not connected."
+            )
+            self._response_timeout_task = self.create_task(self._response_timeout_watchdog())
+            return
+
+        loop = asyncio.get_running_loop()
+        self._openclaw_reply_text = ""
+        self._openclaw_run_id = None
+        self._openclaw_reply_future = loop.create_future()
+        self._voice_turn_mode = "awaiting_openclaw"
+        self.renderer.update_hint("Rook is thinking... waiting for OpenClaw")
+        self._start_thinking_debug(stage="openclaw")
+
+        try:
+            self.logger.info("Sending text to OpenClaw and waiting for streamed reply")
+            reply_text = await self.agent.openclaw_client.send_chat_and_wait_text(
+                text,
+                timeout=45,
+            )
+        except asyncio.TimeoutError:
+            self._cancel_thinking_debug()
+            self.logger.warning("Timed out waiting for OpenClaw reply")
+            self.renderer.update_hint("OpenClaw timed out. Try again.")
+            self._voice_turn_mode = "idle"
+            self.state_machine.transition_to(AppState.IDLE, force=True)
+            await self.event_bus.publish(
+                Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
+            )
+            return
+        except Exception as exc:
+            self._cancel_thinking_debug()
+            if "Timed out waiting for OpenClaw" in str(exc):
+                self.logger.warning("Timed out waiting for OpenClaw reply")
+                self.renderer.update_hint("OpenClaw timed out. Try again.")
+                self._voice_turn_mode = "idle"
+                self.state_machine.transition_to(AppState.IDLE, force=True)
+                await self.event_bus.publish(
+                    Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
+                )
+                return
+
+            exc_label = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            self.logger.error("OpenClaw request failed: %s", exc_label)
+            self.renderer.update_hint(f"OpenClaw error: {exc_label}")
+            self._voice_turn_mode = "idle"
+            self.state_machine.transition_to(AppState.IDLE, force=True)
+            await self.event_bus.publish(
+                Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
+            )
+            return
+        finally:
+            self._openclaw_reply_future = None
+
+        self._cancel_thinking_debug()
+        reply_text = reply_text.strip() or self._openclaw_reply_text.strip()
+        if not reply_text:
+            reply_text = "I didn't receive a reply from OpenClaw."
+
+        self.logger.info(
+            "OpenClaw reply assembled (%s chars): %r",
+            len(reply_text),
+            reply_text[:200],
+        )
+        self._pending_agent_transcript = reply_text
+        self._latest_agent_transcript = ""
+        self._assistant_audio_buffer.clear()
+        self._assistant_audio_mime_type = f"audio/pcm;rate={self.config.tts_sample_rate}"
+        self._agent_playback_started = False
+        self._voice_turn_mode = "tts_speaking"
+        self.renderer.update_hint("Rook is thinking... preparing voice")
+        self._start_thinking_debug(stage="tts")
+        if not await self._ensure_voice_session(force_reconnect=True):
+            self._cancel_thinking_debug()
+            self.logger.error("Failed to restart Gemini session for TTS")
+            self.renderer.update_agent_transcript(reply_text)
+            self.renderer.update_hint("TTS error: could not start Gemini voice")
+            self._voice_turn_mode = "idle"
+            self.state_machine.transition_to(AppState.IDLE, force=True)
+            await self.event_bus.publish(
+                Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
+            )
+            return
+        try:
+            self.logger.info(
+                "Sending %s chars to Gemini TTS: %r",
+                len(reply_text),
+                reply_text[:200],
+            )
+            await self.voice_provider.send_text(
+                f"Say exactly this text and nothing else: {reply_text}"
+            )
+        except Exception as exc:
+            self._cancel_thinking_debug()
+            exc_label = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            self.logger.error("Gemini TTS handoff failed: %s", exc_label)
+            self.renderer.update_agent_transcript(reply_text)
+            self.renderer.update_hint(f"TTS error: {exc_label}")
+            self._voice_turn_mode = "idle"
+            self.state_machine.transition_to(AppState.IDLE, force=True)
+            await self.event_bus.publish(
+                Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
+            )
+            return
+        self._response_timeout_task = self.create_task(self._response_timeout_watchdog())
+
+    async def _on_agent_message_received(self, event: Event) -> None:
+        """Accumulate OpenClaw text while waiting for the agent reply."""
+        if self._voice_turn_mode != "awaiting_openclaw":
+            return
+
+        content = (event.data.get("content") or "").strip()
+        state = event.data.get("state")
+        run_id = event.data.get("run_id")
+
+        if run_id and self._openclaw_run_id is None:
+            self._openclaw_run_id = run_id
+        if run_id and self._openclaw_run_id and run_id != self._openclaw_run_id:
+            return
+
+        if content:
+            self._openclaw_reply_text = self._merge_agent_transcript(
+                self._openclaw_reply_text,
+                content,
+                is_final=(state == "final"),
+            )
+            self.logger.info(
+                "Event-bus OpenClaw text update (state=%s, run_id=%s, total_chars=%s): %r",
+                state,
+                run_id,
+                len(self._openclaw_reply_text),
+                self._openclaw_reply_text[:160],
+            )
+
+        if state == "final" and self._openclaw_reply_future and not self._openclaw_reply_future.done():
+            self._openclaw_reply_future.set_result(self._openclaw_reply_text)
+
+    async def _on_task_progress(self, event: Event) -> None:
+        """Use OpenClaw lifecycle end as a fallback finalization signal."""
+        if self._voice_turn_mode != "awaiting_openclaw":
+            return
+
+        run_id = event.data.get("run_id")
+        phase = event.data.get("phase")
+        if run_id and self._openclaw_run_id is None:
+            self._openclaw_run_id = run_id
+        if run_id and self._openclaw_run_id and run_id != self._openclaw_run_id:
+            return
+
+        if phase == "end" and self._openclaw_reply_future and not self._openclaw_reply_future.done():
+            self._openclaw_reply_future.set_result(self._openclaw_reply_text)
+
+    def _start_thinking_debug(self, stage: str) -> None:
+        """Start a debug watchdog for the current waiting stage."""
+        self._cancel_thinking_debug()
+        self._thinking_debug_task = self.create_task(self._thinking_debug_watchdog(stage))
+
+    def _cancel_thinking_debug(self) -> None:
+        """Cancel the current thinking-stage watchdog."""
+        if self._thinking_debug_task and not self._thinking_debug_task.done():
+            self._thinking_debug_task.cancel()
+        self._thinking_debug_task = None
+
+    async def _thinking_debug_watchdog(self, stage: str) -> None:
+        """Emit stage-specific debug signals while the app appears stuck."""
+        checkpoints = (
+            (5, "still waiting"),
+            (12, "long wait"),
+            (25, "very long wait"),
+        )
+
+        started = time.monotonic()
+        try:
+            for seconds, label in checkpoints:
+                await asyncio.sleep(max(0, seconds - (time.monotonic() - started)))
+                if stage == "openclaw" and self._voice_turn_mode == "awaiting_openclaw":
+                    self.logger.warning(
+                        "Rook thinking debug (%s): waiting on OpenClaw for %.1fs; partial_reply_chars=%s",
+                        label,
+                        time.monotonic() - started,
+                        len(self._openclaw_reply_text),
+                    )
+                    self.renderer.update_hint(
+                        f"Rook is thinking... waiting for OpenClaw ({seconds}s)"
+                    )
+                elif stage == "tts" and self._voice_turn_mode == "tts_speaking":
+                    self.logger.warning(
+                        "Rook thinking debug (%s): waiting on Gemini TTS for %.1fs; buffered_audio=%s bytes; pending_text_chars=%s",
+                        label,
+                        time.monotonic() - started,
+                        len(self._assistant_audio_buffer),
+                        len(self._pending_agent_transcript),
+                    )
+                    self.renderer.update_hint(
+                        f"Rook is thinking... waiting for voice ({seconds}s)"
+                    )
+                else:
+                    return
+        except asyncio.CancelledError:
+            return
 
     def request_shutdown(self) -> None:
         """Request app shutdown from signal handlers or key commands."""

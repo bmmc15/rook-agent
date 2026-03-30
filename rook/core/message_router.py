@@ -63,9 +63,9 @@ class MessageRouter:
         """
         if self.openclaw_client and self.openclaw_client.is_connected:
             # Send to OpenClaw
-            await self.openclaw_client.send_chat(content)
+            request_id = await self.openclaw_client.send_chat(content)
             # Response will come via streaming
-            return "Processing..."
+            return f"OpenClaw request sent ({request_id[:8]}...)"
 
         else:
             # No OpenClaw - generate local response
@@ -82,8 +82,8 @@ class MessageRouter:
         """
         if self.openclaw_client and self.openclaw_client.is_connected:
             # Send to OpenClaw as a task
-            await self.openclaw_client.send_task(content)
-            return "Task created..."
+            request_id = await self.openclaw_client.send_task(content)
+            return f"OpenClaw task sent ({request_id[:8]}...)"
 
         else:
             # No OpenClaw - return error
