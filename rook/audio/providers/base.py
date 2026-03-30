@@ -48,6 +48,11 @@ class BaseVoiceProvider(ABC):
         pass
 
     @abstractmethod
+    async def send_text(self, text: str) -> None:
+        """Send a text turn to the service."""
+        pass
+
+    @abstractmethod
     async def receive(self) -> AsyncIterator[VoiceEvent]:
         """Receive events from the service.
 

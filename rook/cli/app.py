@@ -12,8 +12,10 @@ from rook.audio.playback import AudioPlayback
 from rook.audio.providers.base import VoiceEvent, VoiceEventType
 from rook.audio.providers.gemini_live import GeminiLiveProvider
 from rook.audio.waveform_processor import WaveformProcessor
+from rook.cli.commands import CommandHandler
 from rook.cli.input_handler import InputHandler
 from rook.cli.renderer import Renderer
+from rook.core.agent import Agent
 from rook.core.config import get_config
 from rook.core.events import EventBus, get_event_bus, Event, EventType
 from rook.core.state_machine import StateMachine, AppState
@@ -41,6 +43,8 @@ class RookApp:
         self.console = Console(theme=None)
         self.state_machine = StateMachine()
         self.event_bus = get_event_bus()
+        self.agent = Agent(self.config, self.event_bus)
+        self.command_handler = CommandHandler(self.agent, self.state_machine, self.event_bus)
 
         # Create renderer
         self.renderer = Renderer(
@@ -54,7 +58,11 @@ class RookApp:
         self.audio_capture = AudioCapture(self.config)
         self.audio_playback = AudioPlayback(self.config)
         self.waveform_processor = WaveformProcessor(bar_count=20)
-        self.input_handler = InputHandler(self.state_machine, self.event_bus)
+        self.input_handler = InputHandler(
+            self.state_machine,
+            self.event_bus,
+            on_text_submit=self._handle_text_submission,
+        )
         self.voice_provider: Optional[GeminiLiveProvider] = None
         if self.config.gemini_api_key:
             self.voice_provider = GeminiLiveProvider(
@@ -95,6 +103,7 @@ class RookApp:
 
             # Start renderer
             await self.renderer.start()
+            await self.agent.start()
 
             self.event_bus.subscribe(EventType.AUDIO_INPUT_STARTED, self._on_audio_input_started)
             self.event_bus.subscribe(EventType.AUDIO_INPUT_STOPPED, self._on_audio_input_stopped)
@@ -181,6 +190,8 @@ class RookApp:
 
             self.event_bus.unsubscribe(EventType.AUDIO_INPUT_STARTED, self._on_audio_input_started)
             self.event_bus.unsubscribe(EventType.AUDIO_INPUT_STOPPED, self._on_audio_input_stopped)
+
+            await self.agent.stop()
 
             # Stop event bus
             await asyncio.wait_for(self.event_bus.stop(), timeout=2)
@@ -361,13 +372,6 @@ class RookApp:
 
         if voice_event.type == VoiceEventType.AUDIO_DATA:
             self._cancel_response_timeout()
-            if self.state_machine.current_state != AppState.SPEAKING:
-                self.state_machine.transition_to(AppState.SPEAKING, force=True)
-                await self.event_bus.publish(
-                    Event(type=EventType.STATE_CHANGED, data={"state": AppState.SPEAKING})
-                )
-                self.renderer.update_hint("Speaking...")
-
             self._assistant_audio_buffer.extend(voice_event.data["audio"])
             self._assistant_audio_mime_type = voice_event.data.get(
                 "mime_type",
@@ -400,17 +404,15 @@ class RookApp:
                     self.audio_playback.play(
                         bytes(self._assistant_audio_buffer),
                         mime_type=self._assistant_audio_mime_type,
+                        on_start=self._on_playback_started,
+                        on_chunk=self._on_playback_chunk,
                     )
                 )
-                await asyncio.sleep(0.12)
-                self._agent_playback_started = True
-                if self._pending_agent_transcript:
-                    self._latest_agent_transcript = self._pending_agent_transcript
-                    self.renderer.update_agent_transcript(self._latest_agent_transcript)
                 await playback_task
                 await self.event_bus.publish(Event(type=EventType.AUDIO_OUTPUT_STOPPED, data={}))
                 self._assistant_audio_buffer.clear()
                 self._agent_playback_started = False
+                self.renderer.update_orb_activity(0.0)
 
                 if not self.audio_capture.is_running:
                     await self.audio_capture.start()
@@ -541,6 +543,84 @@ class RookApp:
             i += 1
 
         return " ".join(healed_words).strip()
+
+    def _on_playback_chunk(self, chunk: bytes) -> None:
+        """Drive the orb from actual outgoing assistant audio."""
+        if not self._loop:
+            return
+
+        audio = self._pcm16_rms(chunk)
+        self._loop.call_soon_threadsafe(self.renderer.update_orb_activity, audio)
+
+    def _on_playback_started(self) -> None:
+        """Sync speaking state and transcript to the first audible playback chunk."""
+        if not self._loop:
+            return
+
+        self._loop.call_soon_threadsafe(lambda: self.create_task(self._mark_playback_started()))
+
+    async def _mark_playback_started(self) -> None:
+        """Update state once playback has actually started."""
+        if self._agent_playback_started:
+            return
+
+        self._agent_playback_started = True
+        self.state_machine.transition_to(AppState.SPEAKING, force=True)
+        await self.event_bus.publish(
+            Event(type=EventType.STATE_CHANGED, data={"state": AppState.SPEAKING})
+        )
+        self.renderer.update_hint("Speaking...")
+
+        if self._pending_agent_transcript:
+            self._latest_agent_transcript = self._pending_agent_transcript
+            self.renderer.update_agent_transcript(self._latest_agent_transcript)
+
+    def _pcm16_rms(self, chunk: bytes) -> float:
+        """Compute a normalized RMS level from a PCM16 mono chunk."""
+        if not chunk:
+            return 0.0
+
+        import numpy as np
+
+        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+        if samples.size == 0:
+            return 0.0
+
+        rms = float(np.sqrt(np.mean(samples * samples)))
+        return min(1.0, rms * 6.0)
+
+    async def _handle_text_submission(self, text: str) -> None:
+        """Process a typed text turn or command."""
+        self.logger.info("Received typed input: %r", text[:120])
+
+        if text.startswith("/"):
+            response = await self.command_handler.handle_command(text)
+            if text.strip().lower() == "/quit":
+                self.request_shutdown()
+            if response:
+                self._latest_user_transcript = text
+                self.renderer.update_user_transcript(text)
+                self._latest_agent_transcript = response
+                self.renderer.update_agent_transcript(response)
+            return
+
+        self._assistant_audio_buffer.clear()
+        self._pending_agent_transcript = ""
+        self._latest_agent_transcript = ""
+        self._latest_user_transcript = text
+        self.renderer.clear_transcripts()
+        self.renderer.update_user_transcript(text)
+
+        if not await self._ensure_voice_session():
+            return
+
+        self.state_machine.transition_to(AppState.PROCESSING, force=True)
+        await self.event_bus.publish(
+            Event(type=EventType.STATE_CHANGED, data={"state": AppState.PROCESSING})
+        )
+        self.renderer.update_hint("Thinking...")
+        await self.voice_provider.send_text(text)
+        self._response_timeout_task = self.create_task(self._response_timeout_watchdog())
 
     async def _ensure_voice_session(self) -> bool:
         """Ensure there is an active Gemini session and receiver task."""

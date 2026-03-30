@@ -163,3 +163,7 @@ class Renderer:
     def clear_transcripts(self) -> None:
         """Clear the transcript area."""
         self._panel.transcript.clear()
+
+    def update_orb_activity(self, level: float) -> None:
+        """Drive the orb with live speaking energy."""
+        self._panel.orb.set_activity(level)

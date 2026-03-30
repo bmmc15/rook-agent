@@ -5,7 +5,7 @@ from rich.align import Align
 from rich.console import RenderableType
 from rich.text import Text
 
-from rook.cli.themes import WAVEFORM_BLOCKS, Colors
+from rook.cli.themes import Colors, WAVEFORM_BLOCKS
 
 
 class WaveformWidget:
@@ -57,11 +57,8 @@ class WaveformWidget:
             return Text("")
 
         text = Text("You ", style=Colors.STATUS_TEXT)
-
         for height in self._bar_heights:
-            # Clamp height to valid range
             height = max(0, min(8, height))
-            block = WAVEFORM_BLOCKS[height]
-            text.append(block, style=Colors.WAVEFORM)
+            text.append(WAVEFORM_BLOCKS[height], style=Colors.WAVEFORM)
 
         return Align.left(text)

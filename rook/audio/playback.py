@@ -4,6 +4,7 @@ import re
 import time
 import wave
 from pathlib import Path
+from typing import Callable, Optional
 import numpy as np
 import sounddevice as sd
 
@@ -28,7 +29,13 @@ class AudioPlayback:
         self._playing = False
         self._stop_requested = False
 
-    async def play(self, audio_data: bytes, mime_type: str = "audio/pcm;rate=24000") -> None:
+    async def play(
+        self,
+        audio_data: bytes,
+        mime_type: str = "audio/pcm;rate=24000",
+        on_start: Optional[Callable[[], None]] = None,
+        on_chunk: Optional[Callable[[bytes], None]] = None,
+    ) -> None:
         """Play audio data.
 
         Args:
@@ -44,6 +51,8 @@ class AudioPlayback:
                 self._play_blocking,
                 audio_bytes,
                 sample_rate,
+                on_start,
+                on_chunk,
             )
 
         except Exception as e:
@@ -76,7 +85,13 @@ class AudioPlayback:
         # Keep the raw PCM16 byte stream intact for playback.
         return bytes(audio_data), sample_rate
 
-    def _play_blocking(self, audio_bytes: bytes, sample_rate: int) -> None:
+    def _play_blocking(
+        self,
+        audio_bytes: bytes,
+        sample_rate: int,
+        on_start: Optional[Callable[[], None]] = None,
+        on_chunk: Optional[Callable[[bytes], None]] = None,
+    ) -> None:
         """Play audio synchronously in a worker thread using raw PCM writes."""
         chunk_bytes = 4096
         stream = sd.RawOutputStream(
@@ -89,10 +104,18 @@ class AudioPlayback:
         self._stream = stream
         try:
             stream.start()
+            started = False
             for start in range(0, len(audio_bytes), chunk_bytes):
                 if self._stop_requested:
                     break
-                stream.write(audio_bytes[start : start + chunk_bytes])
+                chunk = audio_bytes[start : start + chunk_bytes]
+                if not started:
+                    started = True
+                    if on_start is not None:
+                        on_start()
+                if on_chunk is not None:
+                    on_chunk(chunk)
+                stream.write(chunk)
         finally:
             try:
                 stream.stop()

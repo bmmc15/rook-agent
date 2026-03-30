@@ -96,6 +96,24 @@ class GeminiLiveProvider(BaseVoiceProvider):
             logger.error("Failed to send audio to Gemini: %s", exc)
             raise VoiceProviderError(f"Send failed: {exc}") from exc
 
+    async def send_text(self, text: str) -> None:
+        """Send a text turn to the live session."""
+        if not self._connected or not self._session:
+            raise VoiceProviderError("Not connected")
+
+        try:
+            await self._session.send_client_content(
+                turns={
+                    "role": "user",
+                    "parts": [{"text": text}],
+                },
+                turn_complete=True,
+            )
+            logger.info("Sent text turn to Gemini: %r", text[:80])
+        except Exception as exc:
+            logger.error("Failed to send text to Gemini: %s", exc)
+            raise VoiceProviderError(f"Send failed: {exc}") from exc
+
     async def begin_activity(self) -> None:
         """Mark the beginning of a push-to-talk turn."""
         if not self._connected or not self._session:

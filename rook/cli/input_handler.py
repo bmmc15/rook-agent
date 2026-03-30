@@ -5,7 +5,7 @@ import select
 import termios
 import time
 import tty
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from rook.core.events import EventBus, Event, EventType
 from rook.core.state_machine import StateMachine, AppState
@@ -17,7 +17,12 @@ logger = get_logger(__name__)
 class InputHandler:
     """Handles keyboard input for voice activation."""
 
-    def __init__(self, state_machine: StateMachine, event_bus: EventBus):
+    def __init__(
+        self,
+        state_machine: StateMachine,
+        event_bus: EventBus,
+        on_text_submit: Optional[Callable[[str], Awaitable[None]]] = None,
+    ):
         """Initialize input handler.
 
         Args:
@@ -28,6 +33,7 @@ class InputHandler:
         self.event_bus = event_bus
         self._running = False
         self._listening = False
+        self._on_text_submit = on_text_submit
         self._fd: Optional[int] = None
         self._original_terminal_settings = None
         self._last_space_press = 0.0
@@ -74,10 +80,13 @@ class InputHandler:
 
                 if char in ("\r", "\n"):
                     command = self._command_buffer.strip().lower()
+                    raw_command = self._command_buffer.strip()
                     self._command_buffer = ""
                     if command in {"quit", "exit"}:
                         logger.info("Quit command requested: %s", command)
                         return False
+                    if raw_command and self._on_text_submit is not None:
+                        await self._on_text_submit(raw_command)
                     return True
 
                 if char in ("\x7f", "\b"):
