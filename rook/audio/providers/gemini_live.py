@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Optional, Sequence
 
 from google import genai
 from google.genai import types
@@ -17,12 +17,29 @@ logger = get_logger(__name__)
 class GeminiLiveProvider(BaseVoiceProvider):
     """Voice provider using Google's Live API."""
 
-    def __init__(self, api_key: str, model: str):
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        *,
+        session_label: str = "voice",
+        response_modalities: Sequence[str] = ("AUDIO",),
+        enable_input_transcription: bool = False,
+        enable_output_transcription: bool = False,
+        voice_name: Optional[str] = None,
+        system_instruction: Optional[str] = None,
+    ):
         if not api_key:
             raise VoiceProviderError("Gemini API key is required")
 
         self.api_key = api_key
         self.model_name = model
+        self.session_label = session_label
+        self.response_modalities = tuple(response_modalities)
+        self.enable_input_transcription = enable_input_transcription
+        self.enable_output_transcription = enable_output_transcription
+        self.voice_name = voice_name
+        self.system_instruction = system_instruction
         self._client = genai.Client(api_key=api_key)
         self._live_connection = None
         self._session = None
@@ -34,23 +51,30 @@ class GeminiLiveProvider(BaseVoiceProvider):
         if self._connected:
             return
 
-        config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            input_audio_transcription={},
-            output_audio_transcription={},
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Kore",
-                    )
-                )
-            ),
-            realtime_input_config=types.RealtimeInputConfig(
+        config_kwargs = {
+            "response_modalities": list(self.response_modalities),
+            "realtime_input_config": types.RealtimeInputConfig(
                 automatic_activity_detection=types.AutomaticActivityDetection(
                     disabled=True,
                 )
             ),
-        )
+        }
+        if self.enable_input_transcription:
+            config_kwargs["input_audio_transcription"] = {}
+        if self.enable_output_transcription:
+            config_kwargs["output_audio_transcription"] = {}
+        if self.voice_name:
+            config_kwargs["speech_config"] = types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=self.voice_name,
+                    )
+                )
+            )
+        if self.system_instruction:
+            config_kwargs["system_instruction"] = self.system_instruction
+
+        config = types.LiveConnectConfig(**config_kwargs)
 
         try:
             self._live_connection = self._client.aio.live.connect(
@@ -59,9 +83,17 @@ class GeminiLiveProvider(BaseVoiceProvider):
             )
             self._session = await self._live_connection.__aenter__()
             self._connected = True
-            logger.info("Connected to Gemini Live model %s", self.model_name)
+            logger.info(
+                "Connected to Gemini Live model %s (%s session)",
+                self.model_name,
+                self.session_label,
+            )
         except Exception as exc:
-            logger.error("Failed to connect to Gemini Live API: %s", exc)
+            logger.error(
+                "Failed to connect to Gemini Live API (%s session): %s",
+                self.session_label,
+                exc,
+            )
             raise VoiceProviderError(f"Connection failed: {exc}") from exc
 
     async def disconnect(self) -> None:
@@ -79,7 +111,7 @@ class GeminiLiveProvider(BaseVoiceProvider):
             self._live_connection = None
             self._session = None
             self._connected = False
-            logger.info("Disconnected from Gemini Live API")
+            logger.info("Disconnected from Gemini Live API (%s session)", self.session_label)
 
     async def send_audio(self, audio_data: bytes) -> None:
         """Send a PCM16 audio chunk to the live session."""
@@ -93,9 +125,17 @@ class GeminiLiveProvider(BaseVoiceProvider):
                     mime_type="audio/pcm;rate=16000",
                 )
             )
-            logger.debug("Sent %s bytes of audio to Gemini", len(audio_data))
+            logger.debug(
+                "Sent %s bytes of audio to Gemini (%s session)",
+                len(audio_data),
+                self.session_label,
+            )
         except Exception as exc:
-            logger.error("Failed to send audio to Gemini: %s", exc)
+            try:
+                await self.disconnect()
+            except Exception:
+                pass
+            logger.error("Failed to send audio to Gemini (%s session): %s", self.session_label, exc)
             raise VoiceProviderError(f"Send failed: {exc}") from exc
 
     async def send_text(self, text: str) -> None:
@@ -104,16 +144,23 @@ class GeminiLiveProvider(BaseVoiceProvider):
             raise VoiceProviderError("Not connected")
 
         try:
-            await self._session.send_client_content(
-                turns={
-                    "role": "user",
-                    "parts": [{"text": text}],
-                },
-                turn_complete=True,
+            if self.model_name.startswith("gemini-3.1-"):
+                await self._session.send_realtime_input(text=text)
+            else:
+                await self._session.send_client_content(
+                    turns={
+                        "role": "user",
+                        "parts": [{"text": text}],
+                    },
+                    turn_complete=True,
+                )
+            logger.info(
+                "Sent text turn to Gemini (%s session): %r",
+                self.session_label,
+                text[:80],
             )
-            logger.info("Sent text turn to Gemini: %r", text[:80])
         except Exception as exc:
-            logger.error("Failed to send text to Gemini: %s", exc)
+            logger.error("Failed to send text to Gemini (%s session): %s", self.session_label, exc)
             raise VoiceProviderError(f"Send failed: {exc}") from exc
 
     async def begin_activity(self) -> None:
@@ -122,7 +169,7 @@ class GeminiLiveProvider(BaseVoiceProvider):
             return
 
         await self._session.send_realtime_input(activity_start=types.ActivityStart())
-        logger.info("Sent activity_start to Gemini")
+        logger.info("Sent activity_start to Gemini (%s session)", self.session_label)
 
     async def end_audio(self) -> None:
         """Mark the current push-to-talk turn as finished."""
@@ -130,7 +177,7 @@ class GeminiLiveProvider(BaseVoiceProvider):
             return
 
         await self._session.send_realtime_input(activity_end=types.ActivityEnd())
-        logger.info("Sent activity_end to Gemini")
+        logger.info("Sent activity_end to Gemini (%s session)", self.session_label)
 
     async def receive_turn(self) -> AsyncIterator[VoiceEvent]:
         """Receive messages for a single Gemini turn while keeping the session open."""
@@ -165,7 +212,8 @@ class GeminiLiveProvider(BaseVoiceProvider):
 
                     if server_content and server_content.output_transcription:
                         logger.debug(
-                            "Gemini output transcription: %r (finished=%s)",
+                            "Gemini output transcription (%s session): %r (finished=%s)",
+                            self.session_label,
                             server_content.output_transcription.text,
                             server_content.output_transcription.finished,
                         )
@@ -183,28 +231,43 @@ class GeminiLiveProvider(BaseVoiceProvider):
                             },
                         )
 
-                    audio_data = message.data
-                    if audio_data:
-                        logger.debug("Received %s bytes of audio from Gemini", len(audio_data))
-                        mime_type = "audio/pcm"
-                        if server_content and server_content.model_turn:
-                            for part in server_content.model_turn.parts or []:
-                                if part.inline_data and part.inline_data.mime_type:
-                                    mime_type = part.inline_data.mime_type
-                                    break
-
-                        yield VoiceEvent(
-                            type=VoiceEventType.AUDIO_DATA,
-                            data={"audio": audio_data, "mime_type": mime_type},
-                        )
+                    if server_content and server_content.model_turn:
+                        for part in server_content.model_turn.parts or []:
+                            inline_data = getattr(part, "inline_data", None)
+                            if inline_data and inline_data.data:
+                                logger.debug(
+                                    "Received %s bytes of audio from Gemini (%s session)",
+                                    len(inline_data.data),
+                                    self.session_label,
+                                )
+                                yield VoiceEvent(
+                                    type=VoiceEventType.AUDIO_DATA,
+                                    data={
+                                        "audio": inline_data.data,
+                                        "mime_type": inline_data.mime_type or "audio/pcm",
+                                    },
+                                )
+                            elif getattr(part, "text", None):
+                                yield VoiceEvent(
+                                    type=VoiceEventType.TRANSCRIPT_PARTIAL,
+                                    data={
+                                        "source": "output",
+                                        "text": part.text,
+                                        "finished": False,
+                                    },
+                                )
 
                     if server_content and server_content.turn_complete:
-                        logger.info("Gemini turn complete")
+                        logger.info("Gemini turn complete (%s session)", self.session_label)
                         yield VoiceEvent(type=VoiceEventType.TURN_COMPLETE, data={})
                         return
 
             except Exception as exc:
-                logger.error("Error receiving Gemini Live response: %s", exc)
+                logger.error(
+                    "Error receiving Gemini Live response (%s session): %s",
+                    self.session_label,
+                    exc,
+                )
                 self._connected = False
                 self._session = None
                 self._live_connection = None
