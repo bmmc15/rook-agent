@@ -1,11 +1,8 @@
 """Audio playback using sounddevice."""
 import asyncio
+import queue
 import re
-import time
-import wave
-from pathlib import Path
 from typing import Callable, Optional
-import numpy as np
 import sounddevice as sd
 
 from rook.core.config import Config
@@ -28,6 +25,8 @@ class AudioPlayback:
         self._stream: sd.OutputStream | None = None
         self._playing = False
         self._stop_requested = False
+        self._stream_queue: queue.Queue[bytes | None] | None = None
+        self._stream_task: asyncio.Task | None = None
 
     async def play(
         self,
@@ -44,7 +43,6 @@ class AudioPlayback:
         """
         try:
             audio_bytes, sample_rate = self._decode_audio(audio_data, mime_type)
-            self._write_debug_wav(audio_bytes, sample_rate)
             self._playing = True
             self._stop_requested = False
             await asyncio.to_thread(
@@ -64,7 +62,16 @@ class AudioPlayback:
     async def stop(self) -> None:
         """Stop current playback."""
         self._stop_requested = True
+        if self._stream_queue is not None:
+            try:
+                self._stream_queue.put_nowait(None)
+            except queue.Full:
+                pass
         sd.stop()
+        if self._stream_task:
+            await asyncio.gather(self._stream_task, return_exceptions=True)
+            self._stream_task = None
+        self._stream_queue = None
         self._playing = False
 
     @property
@@ -84,6 +91,47 @@ class AudioPlayback:
 
         # Keep the raw PCM16 byte stream intact for playback.
         return bytes(audio_data), sample_rate
+
+    async def start_stream(
+        self,
+        mime_type: str = "audio/pcm;rate=24000",
+        on_start: Optional[Callable[[], None]] = None,
+        on_chunk: Optional[Callable[[bytes], None]] = None,
+    ) -> None:
+        """Start a streaming playback session fed chunk by chunk."""
+        if self._stream_task and not self._stream_task.done():
+            raise AudioError("Playback stream already active")
+
+        _, sample_rate = self._decode_audio(b"", mime_type)
+        self._stop_requested = False
+        self._playing = True
+        self._stream_queue = queue.Queue()
+        self._stream_task = asyncio.create_task(
+            asyncio.to_thread(
+                self._play_streaming_blocking,
+                sample_rate,
+                on_start,
+                on_chunk,
+            )
+        )
+
+    async def write_chunk(self, chunk: bytes) -> None:
+        """Queue one PCM16 chunk for streaming playback."""
+        if not chunk:
+            return
+        if self._stream_queue is None:
+            raise AudioError("Playback stream is not active")
+        self._stream_queue.put_nowait(chunk)
+
+    async def finish_stream(self) -> None:
+        """Finish the current streaming playback session."""
+        if self._stream_queue is not None:
+            self._stream_queue.put_nowait(None)
+        if self._stream_task is not None:
+            await asyncio.gather(self._stream_task, return_exceptions=True)
+        self._stream_queue = None
+        self._stream_task = None
+        self._playing = False
 
     def _play_blocking(
         self,
@@ -124,12 +172,42 @@ class AudioPlayback:
             stream.close()
             self._stream = None
 
-    def _write_debug_wav(self, audio_bytes: bytes, sample_rate: int) -> None:
-        """Persist the latest assistant reply for audio debugging."""
-        debug_path = Path("data/latest_reply.wav")
-        debug_path.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(debug_path), "wb") as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(audio_bytes)
+    def _play_streaming_blocking(
+        self,
+        sample_rate: int,
+        on_start: Optional[Callable[[], None]] = None,
+        on_chunk: Optional[Callable[[bytes], None]] = None,
+    ) -> None:
+        """Play queued PCM16 chunks as soon as they arrive."""
+        chunk_bytes = 4096
+        stream = sd.RawOutputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="int16",
+            device=self.config.audio_device_index,
+            blocksize=chunk_bytes // 2,
+        )
+        self._stream = stream
+        try:
+            stream.start()
+            started = False
+            while not self._stop_requested:
+                if self._stream_queue is None:
+                    break
+                chunk = self._stream_queue.get()
+                if chunk is None:
+                    break
+                if not started:
+                    started = True
+                    if on_start is not None:
+                        on_start()
+                if on_chunk is not None:
+                    on_chunk(chunk)
+                stream.write(chunk)
+        finally:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            stream.close()
+            self._stream = None

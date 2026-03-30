@@ -1,6 +1,7 @@
 """Gemini Live API voice provider."""
 from __future__ import annotations
 
+import asyncio
 from typing import AsyncIterator, Optional
 
 from google import genai
@@ -26,6 +27,7 @@ class GeminiLiveProvider(BaseVoiceProvider):
         self._live_connection = None
         self._session = None
         self._connected = False
+        self._receive_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Establish a Gemini Live session."""
@@ -130,85 +132,83 @@ class GeminiLiveProvider(BaseVoiceProvider):
         await self._session.send_realtime_input(activity_end=types.ActivityEnd())
         logger.info("Sent activity_end to Gemini")
 
-    async def receive(self) -> AsyncIterator[VoiceEvent]:
-        """Receive messages from Gemini Live and translate them to provider events."""
+    async def receive_turn(self) -> AsyncIterator[VoiceEvent]:
+        """Receive messages for a single Gemini turn while keeping the session open."""
         if not self._connected or not self._session:
             raise VoiceProviderError("Not connected")
 
-        yield VoiceEvent(type=VoiceEventType.CONNECTED, data={})
+        async with self._receive_lock:
+            try:
+                async for message in self._session.receive():
+                    server_content = getattr(message, "server_content", None)
+                    if server_content and server_content.input_transcription:
+                        logger.debug(
+                            "Gemini input transcription: %r (finished=%s)",
+                            server_content.input_transcription.text,
+                            server_content.input_transcription.finished,
+                        )
 
-        try:
-            async for message in self._session.receive():
-                server_content = getattr(message, "server_content", None)
-                if server_content and server_content.input_transcription:
-                    logger.info(
-                        "Gemini input transcription: %r (finished=%s)",
-                        server_content.input_transcription.text,
-                        server_content.input_transcription.finished,
-                    )
+                    if server_content and server_content.input_transcription:
+                        transcription = server_content.input_transcription
+                        yield VoiceEvent(
+                            type=(
+                                VoiceEventType.TRANSCRIPT_FINAL
+                                if transcription.finished
+                                else VoiceEventType.TRANSCRIPT_PARTIAL
+                            ),
+                            data={
+                                "source": "input",
+                                "text": transcription.text or "",
+                                "finished": bool(transcription.finished),
+                            },
+                        )
 
-                if server_content and server_content.input_transcription:
-                    transcription = server_content.input_transcription
-                    yield VoiceEvent(
-                        type=(
-                            VoiceEventType.TRANSCRIPT_FINAL
-                            if transcription.finished
-                            else VoiceEventType.TRANSCRIPT_PARTIAL
-                        ),
-                        data={
-                            "source": "input",
-                            "text": transcription.text or "",
-                            "finished": bool(transcription.finished),
-                        },
-                    )
+                    if server_content and server_content.output_transcription:
+                        logger.debug(
+                            "Gemini output transcription: %r (finished=%s)",
+                            server_content.output_transcription.text,
+                            server_content.output_transcription.finished,
+                        )
+                        transcription = server_content.output_transcription
+                        yield VoiceEvent(
+                            type=(
+                                VoiceEventType.TRANSCRIPT_FINAL
+                                if transcription.finished
+                                else VoiceEventType.TRANSCRIPT_PARTIAL
+                            ),
+                            data={
+                                "source": "output",
+                                "text": transcription.text or "",
+                                "finished": bool(transcription.finished),
+                            },
+                        )
 
-                if server_content and server_content.output_transcription:
-                    logger.info(
-                        "Gemini output transcription: %r (finished=%s)",
-                        server_content.output_transcription.text,
-                        server_content.output_transcription.finished,
-                    )
-                    transcription = server_content.output_transcription
-                    yield VoiceEvent(
-                        type=(
-                            VoiceEventType.TRANSCRIPT_FINAL
-                            if transcription.finished
-                            else VoiceEventType.TRANSCRIPT_PARTIAL
-                        ),
-                        data={
-                            "source": "output",
-                            "text": transcription.text or "",
-                            "finished": bool(transcription.finished),
-                        },
-                    )
+                    audio_data = message.data
+                    if audio_data:
+                        logger.debug("Received %s bytes of audio from Gemini", len(audio_data))
+                        mime_type = "audio/pcm"
+                        if server_content and server_content.model_turn:
+                            for part in server_content.model_turn.parts or []:
+                                if part.inline_data and part.inline_data.mime_type:
+                                    mime_type = part.inline_data.mime_type
+                                    break
 
-                audio_data = message.data
-                if audio_data:
-                    logger.info("Received %s bytes of audio from Gemini", len(audio_data))
-                    mime_type = "audio/pcm"
-                    if server_content and server_content.model_turn:
-                        for part in server_content.model_turn.parts or []:
-                            if part.inline_data and part.inline_data.mime_type:
-                                mime_type = part.inline_data.mime_type
-                                break
+                        yield VoiceEvent(
+                            type=VoiceEventType.AUDIO_DATA,
+                            data={"audio": audio_data, "mime_type": mime_type},
+                        )
 
-                    yield VoiceEvent(
-                        type=VoiceEventType.AUDIO_DATA,
-                        data={"audio": audio_data, "mime_type": mime_type},
-                    )
+                    if server_content and server_content.turn_complete:
+                        logger.info("Gemini turn complete")
+                        yield VoiceEvent(type=VoiceEventType.TURN_COMPLETE, data={})
+                        return
 
-                if server_content and server_content.turn_complete:
-                    logger.info("Gemini turn complete")
-                    yield VoiceEvent(type=VoiceEventType.TURN_COMPLETE, data={})
-
-        except Exception as exc:
-            logger.error("Error receiving Gemini Live response: %s", exc)
-            yield VoiceEvent(type=VoiceEventType.ERROR, data={"error": str(exc)})
-        finally:
-            self._connected = False
-            self._session = None
-            self._live_connection = None
-            yield VoiceEvent(type=VoiceEventType.DISCONNECTED, data={})
+            except Exception as exc:
+                logger.error("Error receiving Gemini Live response: %s", exc)
+                self._connected = False
+                self._session = None
+                self._live_connection = None
+                yield VoiceEvent(type=VoiceEventType.ERROR, data={"error": str(exc)})
 
     @property
     def is_connected(self) -> bool:

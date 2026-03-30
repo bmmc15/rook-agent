@@ -53,8 +53,8 @@ class BaseVoiceProvider(ABC):
         pass
 
     @abstractmethod
-    async def receive(self) -> AsyncIterator[VoiceEvent]:
-        """Receive events from the service.
+    async def receive_turn(self) -> AsyncIterator[VoiceEvent]:
+        """Receive events for the current turn from the service.
 
         Yields:
             VoiceEvent instances

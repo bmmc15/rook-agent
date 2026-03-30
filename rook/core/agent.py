@@ -2,7 +2,6 @@
 from typing import Optional
 
 from rook.adapters.openclaw.client import OpenClawClient
-from rook.adapters.openclaw.streaming import OpenClawStreamingHandler
 from rook.core.config import Config
 from rook.core.events import EventBus, Event, EventType
 from rook.core.message_router import MessageRouter
@@ -26,13 +25,9 @@ class Agent:
 
         # Initialize OpenClaw client if configured
         self.openclaw_client: Optional[OpenClawClient] = None
-        self.openclaw_streaming: Optional[OpenClawStreamingHandler] = None
 
         if config.has_openclaw_config:
             self.openclaw_client = OpenClawClient(config)
-            self.openclaw_streaming = OpenClawStreamingHandler(
-                self.openclaw_client, event_bus
-            )
 
         # Initialize message router
         self.router = MessageRouter(config, self.openclaw_client)
@@ -59,10 +54,6 @@ class Agent:
 
         logger.info("Stopping agent...")
 
-        # Disconnect from OpenClaw
-        if self.openclaw_streaming:
-            await self.openclaw_streaming.stop()
-
         if self.openclaw_client:
             await self.openclaw_client.disconnect()
             await self.event_bus.publish(
@@ -82,9 +73,6 @@ class Agent:
 
         try:
             await self.openclaw_client.connect()
-            if self.openclaw_streaming:
-                await self.openclaw_streaming.start()
-
             await self.event_bus.publish(
                 Event(type=EventType.AGENT_CONNECTED, data={})
             )

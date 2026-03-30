@@ -38,31 +38,25 @@ class MockVoiceProvider(BaseVoiceProvider):
         # In mock mode, just log
         logger.debug(f"Mock received {len(audio_data)} bytes of audio")
 
-    async def receive(self) -> AsyncIterator[VoiceEvent]:
-        """Generate mock responses.
+    async def receive_turn(self) -> AsyncIterator[VoiceEvent]:
+        """Generate one mock response turn.
 
         Yields:
             VoiceEvent instances
         """
-        # Simulate connection event
-        yield VoiceEvent(type=VoiceEventType.CONNECTED, data={})
+        if not self._connected:
+            return
 
-        # Simulate periodic responses
-        counter = 0
-        while self._connected:
-            await asyncio.sleep(2.0)
-
-            # Send mock transcript
-            counter += 1
-            yield VoiceEvent(
-                type=VoiceEventType.TRANSCRIPT_FINAL,
-                data={"text": f"Mock response {counter}"},
-            )
-
-            # Send mock audio
-            yield VoiceEvent(
-                type=VoiceEventType.AUDIO_DATA, data={"audio": b"mock_audio_data"}
-            )
+        await asyncio.sleep(0.2)
+        yield VoiceEvent(
+            type=VoiceEventType.TRANSCRIPT_FINAL,
+            data={"source": "output", "text": "Mock response", "finished": True},
+        )
+        yield VoiceEvent(
+            type=VoiceEventType.AUDIO_DATA,
+            data={"audio": b"\x00\x00" * 1024, "mime_type": "audio/pcm;rate=24000"},
+        )
+        yield VoiceEvent(type=VoiceEventType.TURN_COMPLETE, data={})
 
     @property
     def is_connected(self) -> bool:

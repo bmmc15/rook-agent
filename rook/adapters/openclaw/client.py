@@ -202,7 +202,7 @@ class OpenClawClient:
                 if payload.get("runId") != run_id:
                     continue
 
-                logger.info(
+                logger.debug(
                     "Observed OpenClaw stream event kind=%s state=%s phase=%s run_id=%s",
                     envelope.kind,
                     payload.get("state"),
@@ -214,7 +214,7 @@ class OpenClawClient:
                 if text:
                     assembled = self._merge_text(assembled, text)
                     last_activity = loop.time()
-                    logger.info(
+                    logger.debug(
                         "OpenClaw assembled reply update (run_id=%s, chunk_chars=%s, total_chars=%s): %r",
                         run_id,
                         len(text),
