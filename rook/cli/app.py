@@ -1,6 +1,8 @@
 """Main application orchestrator."""
 import asyncio
+import os
 import signal
+import time
 from typing import Optional
 
 from rich.console import Console
@@ -68,11 +70,15 @@ class RookApp:
         self._assistant_audio_mime_type = f"audio/pcm;rate={self.config.tts_sample_rate}"
         self._latest_user_transcript = ""
         self._latest_agent_transcript = ""
+        self._pending_agent_transcript = ""
+        self._agent_playback_started = False
         self._turn_audio_chunks = 0
         self._turn_audio_bytes = 0
         self._response_timeout_task: Optional[asyncio.Task] = None
         self._voice_receive_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._shutdown_requested_at: Optional[float] = None
+        self._shutdown_signal_count = 0
 
     async def start(self) -> None:
         """Start the application."""
@@ -162,27 +168,30 @@ class RookApp:
                 await asyncio.gather(*self._tasks, return_exceptions=True)
 
             # Stop audio capture
-            await self.audio_capture.stop()
+            await asyncio.wait_for(self.audio_capture.stop(), timeout=2)
 
             if self.voice_provider:
-                await self.voice_provider.disconnect()
+                await asyncio.wait_for(self.voice_provider.disconnect(), timeout=3)
 
             # Stop keyboard input handling
-            await self.input_handler.stop()
+            await asyncio.wait_for(self.input_handler.stop(), timeout=1)
 
             # Stop renderer
-            await self.renderer.stop()
+            await asyncio.wait_for(self.renderer.stop(), timeout=2)
 
             self.event_bus.unsubscribe(EventType.AUDIO_INPUT_STARTED, self._on_audio_input_started)
             self.event_bus.unsubscribe(EventType.AUDIO_INPUT_STOPPED, self._on_audio_input_stopped)
 
             # Stop event bus
-            await self.event_bus.stop()
+            await asyncio.wait_for(self.event_bus.stop(), timeout=2)
 
             self.logger.info("Shutdown complete")
 
         except Exception as e:
             self.logger.error(f"Error during shutdown: {e}")
+        finally:
+            self._shutdown_requested_at = None
+            self._shutdown_signal_count = 0
 
     def _setup_signal_handlers(self) -> None:
         """Setup signal handlers for graceful shutdown."""
@@ -255,6 +264,8 @@ class RookApp:
         self._assistant_audio_mime_type = f"audio/pcm;rate={self.config.tts_sample_rate}"
         self._latest_user_transcript = ""
         self._latest_agent_transcript = ""
+        self._pending_agent_transcript = ""
+        self._agent_playback_started = False
         self._turn_audio_chunks = 0
         self._turn_audio_bytes = 0
         if self._response_timeout_task and not self._response_timeout_task.done():
@@ -326,22 +337,26 @@ class RookApp:
         if voice_event.type in (VoiceEventType.TRANSCRIPT_PARTIAL, VoiceEventType.TRANSCRIPT_FINAL):
             self._cancel_response_timeout()
             source = voice_event.data.get("source")
-            text = voice_event.data.get("text", "").strip()
-            if not text:
+            raw_text = voice_event.data.get("text", "")
+            is_final = bool(voice_event.data.get("finished"))
+            if not raw_text.strip():
                 return
 
             if source == "input":
-                self._latest_user_transcript = self._merge_transcript(
+                self._latest_user_transcript = self._merge_input_transcript(
                     self._latest_user_transcript,
-                    text,
+                    raw_text,
                 )
                 self.renderer.update_user_transcript(self._latest_user_transcript)
             elif source == "output":
-                self._latest_agent_transcript = self._merge_transcript(
-                    self._latest_agent_transcript,
-                    text,
+                self._pending_agent_transcript = self._merge_agent_transcript(
+                    self._pending_agent_transcript,
+                    raw_text,
+                    is_final=is_final,
                 )
-                self.renderer.update_agent_transcript(self._latest_agent_transcript)
+                if self._agent_playback_started:
+                    self._latest_agent_transcript = self._pending_agent_transcript
+                    self.renderer.update_agent_transcript(self._latest_agent_transcript)
             return
 
         if voice_event.type == VoiceEventType.AUDIO_DATA:
@@ -358,6 +373,11 @@ class RookApp:
                 "mime_type",
                 self._assistant_audio_mime_type,
             )
+            self.logger.info(
+                "Buffered Gemini audio chunk: %s bytes (%s)",
+                len(voice_event.data["audio"]),
+                self._assistant_audio_mime_type,
+            )
             return
 
         if voice_event.type == VoiceEventType.TURN_COMPLETE:
@@ -367,13 +387,33 @@ class RookApp:
                 len(self._assistant_audio_buffer),
             )
             if self._assistant_audio_buffer:
+                if self._pending_agent_transcript:
+                    self._latest_agent_transcript = self._pending_agent_transcript
+                    self.renderer.update_agent_transcript(self._latest_agent_transcript)
+
+                # Pause microphone capture during playback to reduce device interference.
+                if self.audio_capture.is_running:
+                    await self.audio_capture.stop()
+
                 await self.event_bus.publish(Event(type=EventType.AUDIO_OUTPUT_STARTED, data={}))
-                await self.audio_playback.play(
-                    bytes(self._assistant_audio_buffer),
-                    mime_type=self._assistant_audio_mime_type,
+                playback_task = asyncio.create_task(
+                    self.audio_playback.play(
+                        bytes(self._assistant_audio_buffer),
+                        mime_type=self._assistant_audio_mime_type,
+                    )
                 )
+                await asyncio.sleep(0.12)
+                self._agent_playback_started = True
+                if self._pending_agent_transcript:
+                    self._latest_agent_transcript = self._pending_agent_transcript
+                    self.renderer.update_agent_transcript(self._latest_agent_transcript)
+                await playback_task
                 await self.event_bus.publish(Event(type=EventType.AUDIO_OUTPUT_STOPPED, data={}))
                 self._assistant_audio_buffer.clear()
+                self._agent_playback_started = False
+
+                if not self.audio_capture.is_running:
+                    await self.audio_capture.start()
 
             self.state_machine.transition_to(AppState.IDLE, force=True)
             await self.event_bus.publish(
@@ -414,29 +454,93 @@ class RookApp:
             self._response_timeout_task.cancel()
         self._response_timeout_task = None
 
-    def _merge_transcript(self, existing: str, incoming: str) -> str:
-        """Merge a streaming transcript delta into a stable visible sentence."""
-        incoming = incoming.strip("\n")
-        if not incoming:
+    def _merge_agent_transcript(self, existing: str, incoming: str, is_final: bool) -> str:
+        """Merge streaming assistant text deltas into a readable sentence."""
+        normalized = self._normalize_transcript_text(incoming)
+        if not normalized:
             return existing
+
+        if is_final:
+            return normalized
 
         if not existing:
-            return incoming.strip()
+            return normalized
 
-        if incoming.startswith(existing):
-            return incoming.strip()
+        if normalized.startswith(existing):
+            return normalized
 
-        if existing.startswith(incoming):
+        if existing.startswith(normalized):
             return existing
 
-        if incoming in existing:
+        if normalized in existing:
             return existing
 
         separator = ""
-        if not existing.endswith(" ") and not incoming.startswith((" ", ".", ",", "!", "?", ";", ":")):
+        if not existing.endswith(" ") and not normalized.startswith((" ", ".", ",", "!", "?", ";", ":")):
             separator = " "
 
-        return f"{existing}{separator}{incoming}".strip()
+        return f"{existing}{separator}{normalized}".strip()
+
+    def _merge_input_transcript(self, existing: str, incoming: str) -> str:
+        """Merge streaming user text chunks while preserving whole words."""
+        incoming = incoming.rstrip("\n")
+        stripped = incoming.strip()
+        if not stripped:
+            return existing
+
+        if not existing:
+            return self._normalize_transcript_text(stripped)
+
+        if stripped.startswith(existing):
+            return self._normalize_transcript_text(stripped)
+
+        if existing.startswith(stripped):
+            return existing
+
+        if incoming[:1].isspace():
+            merged = f"{existing} {stripped}"
+        elif stripped.startswith(("-", "'", "’")):
+            merged = f"{existing}{stripped}"
+        elif existing[-1:].isalnum() and stripped[:1].islower():
+            merged = f"{existing}{stripped}"
+        elif stripped in existing:
+            merged = existing
+        else:
+            merged = f"{existing} {stripped}"
+
+        return self._normalize_transcript_text(merged)
+
+    def _normalize_transcript_text(self, text: str) -> str:
+        """Clean up streaming transcript spacing for display."""
+        text = " ".join(text.split())
+
+        # Heal common ASR artifacts where letters of the same word are split apart.
+        while "  " in text:
+            text = text.replace("  ", " ")
+
+        for punctuation in (".", ",", "!", "?", ";", ":"):
+            text = text.replace(f" {punctuation}", punctuation)
+
+        words = text.split(" ")
+        healed_words: list[str] = []
+        i = 0
+        while i < len(words):
+            word = words[i]
+            if len(word) == 1 and word.isalpha():
+                j = i
+                merged = []
+                while j < len(words) and len(words[j]) == 1 and words[j].isalpha():
+                    merged.append(words[j])
+                    j += 1
+                if len(merged) >= 3:
+                    healed_words.append("".join(merged))
+                    i = j
+                    continue
+
+            healed_words.append(word)
+            i += 1
+
+        return " ".join(healed_words).strip()
 
     async def _ensure_voice_session(self) -> bool:
         """Ensure there is an active Gemini session and receiver task."""
@@ -462,10 +566,20 @@ class RookApp:
 
     def request_shutdown(self) -> None:
         """Request app shutdown from signal handlers or key commands."""
+        self._shutdown_signal_count += 1
+
         if self._shutdown_event.is_set():
+            self.logger.warning(
+                "Shutdown requested again while already shutting down (count=%s)",
+                self._shutdown_signal_count,
+            )
+            if self._shutdown_signal_count >= 2:
+                self.logger.error("Forcing process exit after repeated shutdown request")
+                os._exit(130)
             return
 
         self.logger.info("Shutdown requested")
+        self._shutdown_requested_at = time.monotonic()
         self._shutdown_event.set()
         try:
             asyncio.create_task(self.audio_playback.stop())

@@ -2,6 +2,8 @@
 import asyncio
 import re
 import time
+import wave
+from pathlib import Path
 import numpy as np
 import sounddevice as sd
 
@@ -34,12 +36,13 @@ class AudioPlayback:
             mime_type: MIME type for the audio payload
         """
         try:
-            audio_array, sample_rate = self._decode_audio(audio_data, mime_type)
+            audio_bytes, sample_rate = self._decode_audio(audio_data, mime_type)
+            self._write_debug_wav(audio_bytes, sample_rate)
             self._playing = True
             self._stop_requested = False
             await asyncio.to_thread(
                 self._play_blocking,
-                audio_array,
+                audio_bytes,
                 sample_rate,
             )
 
@@ -60,8 +63,8 @@ class AudioPlayback:
         """Check if audio is currently playing."""
         return self._playing
 
-    def _decode_audio(self, audio_data: bytes, mime_type: str) -> tuple[np.ndarray, int]:
-        """Decode PCM audio bytes into an int16 numpy array."""
+    def _decode_audio(self, audio_data: bytes, mime_type: str) -> tuple[bytes, int]:
+        """Validate PCM audio bytes and extract the sample rate."""
         if not mime_type.startswith("audio/pcm"):
             raise AudioError(f"Unsupported audio format: {mime_type}")
 
@@ -70,18 +73,40 @@ class AudioPlayback:
         if match:
             sample_rate = int(match.group(1))
 
-        audio_array = np.frombuffer(audio_data, dtype=np.int16).copy()
-        return audio_array, sample_rate
+        # Keep the raw PCM16 byte stream intact for playback.
+        return bytes(audio_data), sample_rate
 
-    def _play_blocking(self, audio_array: np.ndarray, sample_rate: int) -> None:
-        """Play audio synchronously in a worker thread."""
-        sd.play(
-            audio_array,
+    def _play_blocking(self, audio_bytes: bytes, sample_rate: int) -> None:
+        """Play audio synchronously in a worker thread using raw PCM writes."""
+        chunk_bytes = 4096
+        stream = sd.RawOutputStream(
             samplerate=sample_rate,
+            channels=1,
+            dtype="int16",
             device=self.config.audio_device_index,
+            blocksize=chunk_bytes // 2,
         )
-        while sd.get_stream().active:
-            if self._stop_requested:
-                sd.stop()
-                break
-            time.sleep(0.05)
+        self._stream = stream
+        try:
+            stream.start()
+            for start in range(0, len(audio_bytes), chunk_bytes):
+                if self._stop_requested:
+                    break
+                stream.write(audio_bytes[start : start + chunk_bytes])
+        finally:
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            stream.close()
+            self._stream = None
+
+    def _write_debug_wav(self, audio_bytes: bytes, sample_rate: int) -> None:
+        """Persist the latest assistant reply for audio debugging."""
+        debug_path = Path("data/latest_reply.wav")
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(debug_path), "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_bytes)

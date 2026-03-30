@@ -31,6 +31,7 @@ class InputHandler:
         self._fd: Optional[int] = None
         self._original_terminal_settings = None
         self._last_space_press = 0.0
+        self._command_buffer = ""
 
     async def start(self) -> None:
         """Start input handling."""
@@ -71,12 +72,28 @@ class InputHandler:
                     logger.info("Ctrl+C requested")
                     return False
 
+                if char in ("\r", "\n"):
+                    command = self._command_buffer.strip().lower()
+                    self._command_buffer = ""
+                    if command in {"quit", "exit"}:
+                        logger.info("Quit command requested: %s", command)
+                        return False
+                    return True
+
+                if char in ("\x7f", "\b"):
+                    self._command_buffer = self._command_buffer[:-1]
+                    return True
+
                 if char == " ":
                     now = time.monotonic()
                     if now - self._last_space_press < 0.35:
                         return True
                     self._last_space_press = now
                     await self._toggle_listening()
+                    return True
+
+                if char.isprintable():
+                    self._command_buffer += char
 
         return True
 
