@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 from uuid import uuid4
 
 import websockets
@@ -239,6 +239,63 @@ class OpenClawClient:
                             len(assembled),
                         )
                         return assembled
+        finally:
+            self._stream_taps.discard(tap)
+
+    async def send_chat_and_stream_text(
+        self,
+        content: str,
+        session_id: Optional[str] = None,
+        timeout: float = 20.0,
+        idle_timeout: float = 0.2,
+    ) -> AsyncIterator[str]:
+        """Send a chat turn and yield text chunks as they arrive from OpenClaw."""
+        run_id = await self.send_chat(content, session_id=session_id)
+        if not run_id:
+            raise OpenClawError("chat.send did not return a run id")
+
+        tap: asyncio.Queue[GatewayEnvelope] = asyncio.Queue()
+        self._stream_taps.add(tap)
+
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout
+            last_activity: Optional[float] = None
+            prev_assembled = ""
+
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return
+
+                if prev_assembled and last_activity is not None:
+                    remaining = min(remaining, max(0.1, idle_timeout - (loop.time() - last_activity)))
+
+                try:
+                    envelope = await asyncio.wait_for(tap.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    return
+
+                payload = envelope.payload()
+                if payload.get("runId") != run_id:
+                    continue
+
+                text = self._extract_text(payload)
+                if text:
+                    merged = self._merge_text(prev_assembled, text)
+                    new_content = merged[len(prev_assembled):]
+                    if new_content:
+                        yield new_content
+                        prev_assembled = merged
+                        last_activity = loop.time()
+
+                if envelope.kind.startswith("chat") and payload.get("state") == "final":
+                    return
+
+                if envelope.kind.startswith("agent"):
+                    data = payload.get("data")
+                    if isinstance(data, dict) and data.get("phase") == "end":
+                        return
         finally:
             self._stream_taps.discard(tap)
 

@@ -1,6 +1,7 @@
 """Audio capture from microphone using sounddevice."""
 import asyncio
 from typing import AsyncIterator, Optional
+
 import numpy as np
 import sounddevice as sd
 
@@ -22,8 +23,9 @@ class AudioCapture:
         """
         self.config = config
         self._stream: Optional[sd.InputStream] = None
-        self._queue: asyncio.Queue = asyncio.Queue()
+        self._queue: asyncio.Queue[Optional[np.ndarray]] = asyncio.Queue(maxsize=32)
         self._running = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status):
         """Callback for sounddevice stream.
@@ -37,10 +39,23 @@ class AudioCapture:
         if status:
             logger.warning(f"Audio callback status: {status}")
 
+        if not self._running or self._loop is None:
+            return
+
         # Copy data to avoid buffer issues
         data = indata.copy()
 
-        # Put data in queue (non-blocking)
+        # Hand the audio off to the event loop thread safely.
+        try:
+            self._loop.call_soon_threadsafe(self._enqueue_audio_frame, data)
+        except RuntimeError:
+            return
+
+    def _enqueue_audio_frame(self, data: np.ndarray) -> None:
+        """Push a captured frame into the async queue from the loop thread."""
+        if not self._running:
+            return
+
         try:
             self._queue.put_nowait(data)
         except asyncio.QueueFull:
@@ -54,6 +69,10 @@ class AudioCapture:
         logger.info("Starting audio capture...")
 
         try:
+            self._loop = asyncio.get_running_loop()
+            while not self._queue.empty():
+                self._queue.get_nowait()
+
             self._stream = sd.InputStream(
                 samplerate=self.config.audio_sample_rate,
                 channels=self.config.audio_channels,
@@ -83,13 +102,14 @@ class AudioCapture:
             self._stream.close()
             self._stream = None
 
-        # Clear queue
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
 
+        await self._queue.put(None)
+        self._loop = None
         logger.info("Audio capture stopped")
 
     async def stream(self) -> AsyncIterator[np.ndarray]:
@@ -98,13 +118,12 @@ class AudioCapture:
         Yields:
             Audio data as numpy arrays
         """
-        while self._running:
+        while True:
             try:
-                # Wait for data with timeout
-                data = await asyncio.wait_for(self._queue.get(), timeout=0.1)
+                data = await self._queue.get()
+                if data is None:
+                    break
                 yield data
-            except asyncio.TimeoutError:
-                continue
             except Exception as e:
                 logger.error(f"Error in audio stream: {e}")
                 break

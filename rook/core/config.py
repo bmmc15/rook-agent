@@ -22,8 +22,12 @@ class Config(BaseSettings):
         description="Gemini API key for voice services",
     )
     gemini_live_model: str = Field(
-        default="gemini-2.5-flash-native-audio-preview-12-2025",
+        default="gemini-3.1-flash-live-preview",
         description="Gemini Live model for audio conversations",
+    )
+    gemini_session_prompt_path: Path = Field(
+        default=Path("./prompts/gemini_session.md"),
+        description="Markdown file with persistent Gemini session instructions",
     )
 
     # OpenClaw Configuration

@@ -273,6 +273,26 @@ class GeminiLiveProvider(BaseVoiceProvider):
                 self._live_connection = None
                 yield VoiceEvent(type=VoiceEventType.ERROR, data={"error": str(exc)})
 
+    async def reconnect(self, max_retries: int = 3) -> bool:
+        """Attempt to reconnect with exponential backoff."""
+        for attempt in range(max_retries):
+            try:
+                await self.disconnect()
+                delay = min(2 ** attempt, 8)
+                logger.info(
+                    "Reconnecting Gemini Live (%s session), attempt %d/%d after %.1fs",
+                    self.session_label, attempt + 1, max_retries, delay,
+                )
+                await asyncio.sleep(delay)
+                await self.connect()
+                return True
+            except Exception as exc:
+                logger.warning(
+                    "Reconnect attempt %d/%d failed (%s session): %s",
+                    attempt + 1, max_retries, self.session_label, exc,
+                )
+        return False
+
     @property
     def is_connected(self) -> bool:
         """Check if the provider currently has an open session."""
