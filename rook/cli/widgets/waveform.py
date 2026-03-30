@@ -2,7 +2,7 @@
 from typing import List
 
 from rich.align import Align
-from rich.console import RenderableType
+from rich.console import Group, RenderableType
 from rich.text import Text
 
 from rook.cli.themes import Colors, WAVEFORM_BLOCKS
@@ -11,7 +11,7 @@ from rook.cli.themes import Colors, WAVEFORM_BLOCKS
 class WaveformWidget:
     """Green audio waveform bars visualization."""
 
-    def __init__(self, bar_count: int = 20):
+    def __init__(self, bar_count: int = 28):
         """Initialize waveform widget.
 
         Args:
@@ -56,9 +56,13 @@ class WaveformWidget:
         if not self._visible:
             return Text("")
 
-        text = Text("You ", style=Colors.STATUS_TEXT)
+        label = Text("YOU", style=Colors.WAVEFORM)
+        text = Text()
         for height in self._bar_heights:
             height = max(0, min(8, height))
-            text.append(WAVEFORM_BLOCKS[height], style=Colors.WAVEFORM)
+            text.append(WAVEFORM_BLOCKS[height] * 2, style=Colors.WAVEFORM)
 
-        return Align.left(text)
+        return Group(
+            Align.center(label),
+            Align.center(text),
+        )

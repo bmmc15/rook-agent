@@ -16,7 +16,7 @@ class MainPanel:
     def __init__(self):
         """Initialize main panel."""
         self.orb = OrbWidget()
-        self.waveform = WaveformWidget(bar_count=20)
+        self.waveform = WaveformWidget(bar_count=28)
         self.transcript = TranscriptWidget()
         self.status = StatusWidget()
 
@@ -33,7 +33,6 @@ class MainPanel:
         content = Group(
             spacer,
             self.orb.render(),
-            spacer,
             spacer,
             self.waveform.render(),
             spacer,

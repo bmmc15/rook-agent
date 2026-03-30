@@ -65,10 +65,31 @@ def trim_spoken_prefix(full_text: str, spoken_prefix: str) -> str:
     if not normalized_prefix:
         return normalized_full
 
-    if normalized_full.startswith(normalized_prefix):
-        return normalized_full[len(normalized_prefix) :].strip()
+    shared_length = 0
+    max_length = min(len(normalized_full), len(normalized_prefix))
+    while shared_length < max_length and normalized_full[shared_length] == normalized_prefix[shared_length]:
+        shared_length += 1
 
-    if normalized_prefix in normalized_full:
-        return normalized_full.split(normalized_prefix, 1)[1].strip()
+    if shared_length == 0:
+        return normalized_full
 
-    return normalized_full
+    mismatch_inside_word = (
+        shared_length < len(normalized_full)
+        and normalized_full[shared_length - 1].isalnum()
+        and normalized_full[shared_length].isalnum()
+    )
+    if mismatch_inside_word:
+        while shared_length > 0 and normalized_full[shared_length - 1].isalnum():
+            shared_length -= 1
+
+    while shared_length > 0:
+        prev_char = normalized_full[shared_length - 1]
+        next_char = normalized_full[shared_length] if shared_length < len(normalized_full) else ""
+        if not (prev_char.isalnum() and next_char.isalnum()):
+            break
+        shared_length -= 1
+
+    if shared_length <= 0:
+        return normalized_full
+
+    return normalized_full[shared_length:].strip()

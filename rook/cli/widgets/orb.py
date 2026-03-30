@@ -56,6 +56,7 @@ class OrbWidget:
         """
         frame = ORB_FRAMES[self._frame_index]
         lines = []
+        center_row = len(frame) // 2
 
         for row_index, line in enumerate(frame):
             text = Text()
@@ -65,7 +66,9 @@ class OrbWidget:
                 elif char in {"░", "▒"}:
                     text.append(char, style=Colors.ORB_DIM)
                 else:
-                    style = Colors.ORB if self._activity > 0.18 or row_index == 1 else Colors.ORB_DIM
+                    is_core_row = abs(row_index - center_row) <= 1
+                    is_active = self._activity > 0.14
+                    style = Colors.ORB if is_active or is_core_row else Colors.ORB_DIM
                     text.append(char, style=style)
             lines.append(text)
 

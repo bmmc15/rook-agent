@@ -60,7 +60,7 @@ class RookApp:
         # Create audio components
         self.audio_capture = AudioCapture(self.config)
         self.audio_playback = AudioPlayback(self.config)
-        self.waveform_processor = WaveformProcessor(bar_count=20)
+        self.waveform_processor = WaveformProcessor(bar_count=28)
         self.input_handler = InputHandler(
             self.state_machine,
             self.event_bus,
@@ -455,6 +455,7 @@ class RookApp:
         if self._response_timeout_task and not self._response_timeout_task.done():
             self._response_timeout_task.cancel()
         self.renderer.clear_transcripts()
+        self.renderer.update_user_transcript("Listening...", pending=True)
         self._start_phase_timer("Listening...")
         self.logger.info("User turn started")
         if await self._prepare_stt_turn():
@@ -615,7 +616,10 @@ class RookApp:
                     self._latest_user_transcript,
                     raw_text,
                 )
-                self.renderer.update_user_transcript(self._latest_user_transcript)
+                self.renderer.update_user_transcript(
+                    self._latest_user_transcript,
+                    pending=not is_final,
+                )
                 if self._voice_turn_mode == "transcribing_user":
                     if self.state_machine.current_state == AppState.LISTENING:
                         self._update_phase_hint()
@@ -796,30 +800,38 @@ class RookApp:
 
     def _merge_agent_transcript(self, existing: str, incoming: str, is_final: bool) -> str:
         """Merge streaming assistant text deltas into a readable sentence."""
-        normalized = self._normalize_transcript_text(incoming)
-        if not normalized:
+        incoming = incoming.rstrip("\n")
+        stripped = incoming.strip()
+        if not stripped:
             return existing
 
         if is_final:
-            return normalized
+            return self._normalize_transcript_text(stripped)
 
         if not existing:
-            return normalized
+            return self._normalize_transcript_text(stripped)
 
-        if normalized.startswith(existing):
-            return normalized
+        if stripped.startswith(existing):
+            return self._normalize_transcript_text(stripped)
 
-        if existing.startswith(normalized):
+        if existing.startswith(stripped):
             return existing
 
-        if normalized in existing:
+        if stripped in existing:
             return existing
 
-        separator = ""
-        if not existing.endswith(" ") and not normalized.startswith((" ", ".", ",", "!", "?", ";", ":")):
-            separator = " "
+        if incoming[:1].isspace():
+            merged = f"{existing} {stripped}"
+        elif stripped.startswith(("-", "'", "’")):
+            merged = f"{existing}{stripped}"
+        elif stripped.startswith((".", ",", "!", "?", ";", ":", ")", "]")):
+            merged = f"{existing}{stripped}"
+        elif existing[-1:].isalnum() and stripped[:1].islower():
+            merged = f"{existing}{stripped}"
+        else:
+            merged = f"{existing} {stripped}"
 
-        return f"{existing}{separator}{normalized}".strip()
+        return self._normalize_transcript_text(merged)
 
     def _merge_input_transcript(self, existing: str, incoming: str) -> str:
         """Merge streaming user text chunks while preserving whole words."""
@@ -931,7 +943,7 @@ class RookApp:
             self._cancel_thinking_debug()
             self.logger.error("Failed to prepare Gemini session for TTS")
             if transcript_text:
-                self.renderer.update_agent_transcript(transcript_text)
+                self.renderer.update_agent_transcript(transcript_text, pending=False)
             self.renderer.update_hint("TTS error: could not start Gemini voice")
             self._voice_turn_mode = "idle"
             self.state_machine.transition_to(AppState.IDLE, force=True)
@@ -946,8 +958,7 @@ class RookApp:
                 await self._finalize_voice_turn()
             return True
 
-        self._pending_agent_transcript = transcript_text or segment_text
-        self.renderer.update_agent_transcript(self._pending_agent_transcript)
+        self._store_pending_agent_transcript(transcript_text or segment_text)
         self._assistant_audio_buffer.clear()
         self._assistant_audio_mime_type = f"audio/pcm;rate={self.config.tts_sample_rate}"
         self._agent_playback_started = False
@@ -974,7 +985,7 @@ class RookApp:
             exc_label = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
             self.logger.error("Gemini TTS handoff failed: %s", exc_label)
             if transcript_text:
-                self.renderer.update_agent_transcript(transcript_text)
+                self.renderer.update_agent_transcript(transcript_text, pending=False)
             self.renderer.update_hint(f"TTS error: {exc_label}")
             self._voice_turn_mode = "idle"
             self.state_machine.transition_to(AppState.IDLE, force=True)
@@ -1021,7 +1032,14 @@ class RookApp:
 
         if self._pending_agent_transcript:
             self._latest_agent_transcript = self._pending_agent_transcript
-            self.renderer.update_agent_transcript(self._latest_agent_transcript)
+            self.renderer.update_agent_transcript(self._latest_agent_transcript, pending=False)
+
+    def _store_pending_agent_transcript(self, text: str) -> None:
+        """Track streamed assistant text without rendering it before playback starts."""
+        self._pending_agent_transcript = text.strip()
+        if self._agent_playback_started and self._pending_agent_transcript:
+            self._latest_agent_transcript = self._pending_agent_transcript
+            self.renderer.update_agent_transcript(self._latest_agent_transcript, pending=False)
 
     def _pcm16_rms(self, chunk: bytes) -> float:
         """Compute a normalized RMS level from a PCM16 mono chunk."""
@@ -1203,6 +1221,7 @@ class RookApp:
         """Send the transcribed/typed text to OpenClaw and stream the reply to TTS."""
         text = text.strip()
         if not text:
+            self.renderer.clear_transcripts()
             self._voice_turn_mode = "idle"
             self.state_machine.transition_to(AppState.IDLE, force=True)
             await self.event_bus.publish(
@@ -1250,8 +1269,7 @@ class RookApp:
                 idle_timeout=0.2,
             ):
                 reply_text = self._merge_agent_transcript(reply_text, chunk, is_final=False)
-                self._pending_agent_transcript = reply_text
-                self.renderer.update_agent_transcript(reply_text)
+                self._store_pending_agent_transcript(reply_text)
 
                 if lead_segment_task is None:
                     candidate, _ = split_tts_lead_segment(reply_text)
@@ -1326,8 +1344,7 @@ class RookApp:
                 time.monotonic() - self._openclaw_started_at,
             )
 
-        self._pending_agent_transcript = reply_text
-        self.renderer.update_agent_transcript(reply_text)
+        self._store_pending_agent_transcript(reply_text)
 
         if lead_segment_task is not None:
             lead_segment_ok = await lead_segment_task

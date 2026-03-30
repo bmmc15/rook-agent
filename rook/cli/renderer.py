@@ -152,13 +152,13 @@ class Renderer:
         """
         self._panel.status.set_hint(text)
 
-    def update_user_transcript(self, text: str) -> None:
+    def update_user_transcript(self, text: str, *, pending: bool = False) -> None:
         """Update the latest user transcript shown in the panel."""
-        self._panel.transcript.set_user_text(text)
+        self._panel.transcript.set_user_text(text, pending=pending)
 
-    def update_agent_transcript(self, text: str) -> None:
+    def update_agent_transcript(self, text: str, *, pending: bool = False) -> None:
         """Update the latest assistant transcript shown in the panel."""
-        self._panel.transcript.set_agent_text(text)
+        self._panel.transcript.set_agent_text(text, pending=pending)
 
     def clear_transcripts(self) -> None:
         """Clear the transcript area."""
