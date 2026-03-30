@@ -9,30 +9,22 @@ from rook.cli.themes import Colors, ORB_FRAMES
 
 
 class OrbWidget:
-    """Animated orb using the original smooth frame set plus live activity."""
+    """Animated orb with a smooth pulsing effect and live activity glow."""
 
     def __init__(self):
-        """Initialize orb widget."""
         self._frame_index = 0
         self._last_update = time.time()
-        self._speed = 0.5  # Default speed (seconds per frame)
+        self._speed = 0.5
         self._activity = 0.0
         self._target_activity = 0.0
 
     def set_speed(self, speed: float) -> None:
-        """Set animation speed.
-
-        Args:
-            speed: Delay between frames in seconds
-        """
         self._speed = speed
 
     def set_activity(self, level: float) -> None:
-        """Set orb animation intensity based on agent speech energy."""
         self._target_activity = max(0.0, min(1.0, level))
 
     def update(self) -> None:
-        """Update animation frame if enough time has passed."""
         now = time.time()
         delta = max(0.0, now - self._last_update)
 
@@ -49,37 +41,36 @@ class OrbWidget:
             self._last_update = now
 
     def render(self) -> RenderableType:
-        """Render the current orb frame.
-
-        Returns:
-            Rich renderable
-        """
         frame = ORB_FRAMES[self._frame_index]
         lines = []
         center_row = len(frame) // 2
+        is_active = self._activity > 0.14
 
         for row_index, line in enumerate(frame):
             text = Text()
             for char in line:
                 if char == " ":
                     text.append(char)
-                elif char in {"░", "▒"}:
+                elif char == "▒":
                     text.append(char, style=Colors.ORB_DIM)
+                elif char == "▓":
+                    style = Colors.ORB_MID if is_active else Colors.ORB_DIM
+                    text.append(char, style=style)
                 else:
                     is_core_row = abs(row_index - center_row) <= 1
-                    is_active = self._activity > 0.14
-                    style = Colors.ORB if is_active or is_core_row else Colors.ORB_DIM
+                    if is_active:
+                        style = Colors.ORB_ACTIVE
+                    elif is_core_row:
+                        style = Colors.ORB
+                    else:
+                        style = Colors.ORB_MID
                     text.append(char, style=style)
             lines.append(text)
 
-        # Join lines with newlines
         result = Text("\n").join(lines)
-
-        # Center the orb
         return Align.center(result)
 
     def reset(self) -> None:
-        """Reset animation to first frame."""
         self._frame_index = 0
         self._last_update = time.time()
         self._activity = 0.0

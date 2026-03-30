@@ -22,6 +22,7 @@ class InputHandler:
         state_machine: StateMachine,
         event_bus: EventBus,
         on_text_submit: Optional[Callable[[str], Awaitable[None]]] = None,
+        on_buffer_change: Optional[Callable[[str], None]] = None,
     ):
         """Initialize input handler.
 
@@ -34,6 +35,7 @@ class InputHandler:
         self._running = False
         self._listening = False
         self._on_text_submit = on_text_submit
+        self._on_buffer_change = on_buffer_change
         self._fd: Optional[int] = None
         self._original_terminal_settings = None
         self._last_space_press = 0.0
@@ -46,7 +48,7 @@ class InputHandler:
 
         self._running = True
         self._configure_terminal()
-        logger.info("Input handler started (space = listen, q = quit)")
+        logger.info("Input handler started (space = listen when text buffer is empty)")
 
     async def stop(self) -> None:
         """Stop input handling."""
@@ -70,10 +72,6 @@ class InputHandler:
             if char:
                 char = char.lower()
 
-                if char == "q":
-                    logger.info("Quit requested")
-                    return False
-
                 if char == "\x03":
                     logger.info("Ctrl+C requested")
                     return False
@@ -82,6 +80,7 @@ class InputHandler:
                     command = self._command_buffer.strip().lower()
                     raw_command = self._command_buffer.strip()
                     self._command_buffer = ""
+                    self._notify_buffer_change()
                     if command in {"quit", "exit"}:
                         logger.info("Quit command requested: %s", command)
                         return False
@@ -89,11 +88,21 @@ class InputHandler:
                         await self._on_text_submit(raw_command)
                     return True
 
+                if char == "\x1b":
+                    self._command_buffer = ""
+                    self._notify_buffer_change()
+                    return True
+
                 if char in ("\x7f", "\b"):
                     self._command_buffer = self._command_buffer[:-1]
+                    self._notify_buffer_change()
                     return True
 
                 if char == " ":
+                    if self._command_buffer:
+                        self._command_buffer += char
+                        self._notify_buffer_change()
+                        return True
                     now = time.monotonic()
                     if now - self._last_space_press < 0.35:
                         return True
@@ -103,8 +112,14 @@ class InputHandler:
 
                 if char.isprintable():
                     self._command_buffer += char
+                    self._notify_buffer_change()
 
         return True
+
+    def _notify_buffer_change(self) -> None:
+        """Push the current text buffer to the UI preview callback."""
+        if self._on_buffer_change is not None:
+            self._on_buffer_change(self._command_buffer)
 
     def _configure_terminal(self) -> None:
         """Enable cbreak mode so key presses are available immediately."""

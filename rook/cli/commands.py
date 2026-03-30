@@ -49,6 +49,7 @@ class CommandHandler:
             "voice": self._cmd_voice,
             "code": self._cmd_code,
             "quit": self._cmd_quit,
+            "exit": self._cmd_quit,
             "panic": self._cmd_panic,
         }
 
@@ -67,7 +68,10 @@ class CommandHandler:
 /voice on   - Enable voice mode
 /voice off  - Disable voice mode
 /code <desc> - Create a coding task
+/agent      - Route new turns through OpenClaw
+/audio      - Route new turns through Gemini voice mode
 /quit       - Exit the application
+/exit       - Exit the application
 /panic      - Emergency stop all tasks"""
 
     async def _cmd_status(self, args: str) -> str:

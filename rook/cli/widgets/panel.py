@@ -1,6 +1,7 @@
 """Main panel widget that composes all UI elements."""
 from rich.console import Group, RenderableType
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.text import Text
 
 from rook.cli.themes import Colors
@@ -11,37 +12,27 @@ from rook.cli.widgets.waveform import WaveformWidget
 
 
 class MainPanel:
-    """Main UI panel that composes orb, waveform, and status."""
+    """Main UI panel that composes orb, waveform, transcript, and status."""
 
     def __init__(self):
-        """Initialize main panel."""
         self.orb = OrbWidget()
         self.waveform = WaveformWidget(bar_count=28)
         self.transcript = TranscriptWidget()
         self.status = StatusWidget()
 
     def render(self) -> RenderableType:
-        """Render the complete panel.
-
-        Returns:
-            Rich Panel containing all widgets
-        """
-        # Create spacing
-        spacer = Text("")
-
-        # Compose all widgets vertically
         content = Group(
-            spacer,
+            Text(""),
             self.orb.render(),
-            spacer,
+            Text(""),
             self.waveform.render(),
-            spacer,
+            Text(""),
             self.transcript.render(),
-            spacer,
+            Text(""),
+            Rule(style=Colors.SEPARATOR),
             self.status.render(),
         )
 
-        # Wrap in bordered panel
         return Panel(
             content,
             title="[bold]ROOK[/bold]",
