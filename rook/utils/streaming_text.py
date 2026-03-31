@@ -54,7 +54,21 @@ def split_tts_lead_segment(text: str) -> tuple[str, str]:
 
     lead = normalized[:boundary].strip()
     remainder = normalized[boundary:].strip()
+    if not _looks_like_safe_followup(remainder):
+        return "", normalized
     return lead, remainder
+
+
+def _looks_like_safe_followup(text: str) -> bool:
+    """Return True when remainder looks like a fresh sentence, not a broken continuation."""
+    if not text:
+        return False
+
+    first = text[0]
+    if first.isupper() or first.isdigit():
+        return True
+
+    return first in {'"', "'", "“", "(", "["}
 
 
 def trim_spoken_prefix(full_text: str, spoken_prefix: str) -> str:

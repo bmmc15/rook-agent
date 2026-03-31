@@ -38,6 +38,15 @@ def test_split_tts_lead_segment_returns_remainder():
     assert remainder == "The second sentence should wait."
 
 
+def test_split_tts_lead_segment_waits_for_safe_followup_sentence():
+    lead, remainder = split_tts_lead_segment(
+        "A casa de que mais gostaste foi avenidas Nov. ficou em primeiro lugar no teu ranking"
+    )
+
+    assert lead == ""
+    assert remainder == "A casa de que mais gostaste foi avenidas Nov. ficou em primeiro lugar no teu ranking"
+
+
 def test_trim_spoken_prefix_removes_lead_segment():
     remaining = trim_spoken_prefix(
         "The first sentence is ready to speak. The second sentence should wait.",
