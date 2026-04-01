@@ -22,7 +22,6 @@ from rook.core.events import EventBus, get_event_bus, Event, EventType
 from rook.core.state_machine import StateMachine, AppState
 from rook.utils.logging import setup_logging, get_logger
 from rook.utils.exceptions import RookError, AudioError
-from rook.utils.streaming_text import split_tts_lead_segment, trim_spoken_prefix
 
 
 class RookApp:
@@ -87,7 +86,7 @@ class RookApp:
                 model=self.config.gemini_live_model,
                 session_label="tts",
                 response_modalities=("AUDIO",),
-                voice_name="Kore",
+                voice_name=self.config.gemini_voice_name,
                 system_instruction=self._build_gemini_system_instruction("tts"),
             )
             self.audio_mode_provider = GeminiLiveProvider(
@@ -96,7 +95,7 @@ class RookApp:
                 session_label="audio_mode",
                 response_modalities=("AUDIO",),
                 enable_output_transcription=True,
-                voice_name="Kore",
+                voice_name=self.config.gemini_voice_name,
                 system_instruction=self._build_gemini_system_instruction("audio_mode"),
             )
 
@@ -188,6 +187,7 @@ class RookApp:
                         "- Speak only the exact requested text.",
                         "- Keep pronunciation aligned with the language rules above.",
                         "- Preserve the name `Rook` as the agent name.",
+                        "- Keep spoken delivery natural, clean, and easy to understand aloud.",
                     ]
                 )
             )
@@ -200,7 +200,10 @@ class RookApp:
                         "- Answer the user directly instead of delegating to OpenClaw.",
                         "- Keep responses concise, speech-friendly, and natural.",
                         "- Use at most two short sentences unless the user explicitly asks for detail.",
-                        "- Speak in European Portuguese by default unless the user clearly uses another language.",
+                        "- If the user speaks Portuguese, answer in European Portuguese and never in Brazilian Portuguese.",
+                        "- If the user speaks English, answer in English.",
+                        "- Avoid markdown, emojis, awkward symbols, or abbreviations that sound bad when spoken.",
+                        "- Write important names and places in full instead of shortening them.",
                         "- Preserve the name `Rook` as the agent name.",
                     ]
                 )
@@ -553,7 +556,7 @@ class RookApp:
     async def _consume_tts_turn(self) -> None:
         """Consume Gemini TTS output events for one turn."""
         try:
-            await self._consume_tts_turn_once(finalize_after_turn=True)
+            await self._consume_tts_turn_once(finalize_after_turn=True, use_output_transcript=False)
         except asyncio.CancelledError:
             return
         finally:
@@ -564,6 +567,7 @@ class RookApp:
         *,
         provider: Optional[GeminiLiveProvider] = None,
         finalize_after_turn: bool,
+        use_output_transcript: bool = False,
     ) -> bool:
         """Consume one Gemini audio turn and return when it is complete."""
         provider = provider or self.tts_provider
@@ -575,6 +579,7 @@ class RookApp:
                 if await self._handle_tts_voice_event(
                     voice_event,
                     finalize_after_turn=finalize_after_turn,
+                    use_output_transcript=use_output_transcript,
                 ):
                     return True
         except asyncio.CancelledError:
@@ -695,6 +700,7 @@ class RookApp:
         voice_event: VoiceEvent,
         *,
         finalize_after_turn: bool = True,
+        use_output_transcript: bool = False,
     ) -> bool:
         """Handle Gemini TTS output events."""
         if voice_event.type == VoiceEventType.CONNECTED:
@@ -718,7 +724,7 @@ class RookApp:
             return True
 
         if voice_event.type == VoiceEventType.TRANSCRIPT_PARTIAL:
-            if voice_event.data.get("source") == "output":
+            if use_output_transcript and voice_event.data.get("source") == "output":
                 self._pending_agent_transcript = self._merge_agent_transcript(
                     self._pending_agent_transcript,
                     voice_event.data.get("text", ""),
@@ -730,7 +736,7 @@ class RookApp:
             return False
 
         if voice_event.type == VoiceEventType.TRANSCRIPT_FINAL:
-            if voice_event.data.get("source") == "output":
+            if use_output_transcript and voice_event.data.get("source") == "output":
                 self._pending_agent_transcript = self._merge_agent_transcript(
                     self._pending_agent_transcript,
                     voice_event.data.get("text", ""),
@@ -948,10 +954,13 @@ class RookApp:
         """Wrap user text with concise voice-assistant guidance for faster replies."""
         guidance = (
             "You are replying inside a real-time voice assistant. "
-            "Answer in European Portuguese by default unless the user clearly uses another language. "
-            "Be concise and speech-friendly. "
+            "If the user speaks Portuguese, answer in European Portuguese and never in Brazilian Portuguese. "
+            "If the user speaks English, answer in English. "
+            "Your reply will be converted to audio, so be concise and speech-friendly. "
             "Use at most two short sentences unless the user explicitly asks for a list or detailed explanation. "
-            "Do not add preambles, markdown decoration, or unnecessary formatting."
+            "Do not add preambles, markdown decoration, emojis, abbreviations, or unnecessary formatting. "
+            "Write names and places in full so they are easy to speak aloud. "
+            "Do not include citations, source notes, file paths, markdown, or references like Source or memory."
         )
         return f"{guidance}\n\nUser request: {user_text}"
 
@@ -1420,6 +1429,7 @@ class RookApp:
             if not await self._consume_tts_turn_once(
                 provider=self.audio_mode_provider,
                 finalize_after_turn=True,
+                use_output_transcript=True,
             ):
                 self.renderer.update_hint("Gemini audio mode did not return a reply")
         except Exception as exc:
@@ -1475,39 +1485,13 @@ class RookApp:
         tts_prepare_task = self.create_task(self._prepare_tts_turn())
 
         reply_text = ""
-        lead_segment = ""
-        lead_segment_task: Optional[asyncio.Task] = None
         try:
-            self.logger.info("Streaming text from OpenClaw")
-            async for chunk in self.agent.openclaw_client.send_chat_and_stream_text(
+            self.logger.info("Waiting for complete text from OpenClaw")
+            reply_text = await self.agent.openclaw_client.send_chat_and_wait_text(
                 self._build_openclaw_voice_prompt(text),
                 timeout=20,
-                idle_timeout=0.2,
-            ):
-                reply_text = self._merge_agent_transcript(reply_text, chunk, is_final=False)
-                self._store_pending_agent_transcript(reply_text)
-
-                if lead_segment_task is None:
-                    candidate, _ = split_tts_lead_segment(reply_text)
-                    if candidate:
-                        lead_segment = candidate
-                        self.logger.info(
-                            "Starting early TTS from streamed OpenClaw reply (%s chars)",
-                            len(lead_segment),
-                        )
-                        if self._openclaw_started_at is not None:
-                            self.logger.info(
-                                "Timing: early TTS segment unlocked %.2fs after OpenClaw request start",
-                                time.monotonic() - self._openclaw_started_at,
-                            )
-                        lead_segment_task = self.create_task(
-                            self._speak_reply_segment(
-                                lead_segment,
-                                transcript_text=lead_segment,
-                                tts_prepare_task=tts_prepare_task,
-                                finalize_after_turn=False,
-                            )
-                        )
+                idle_timeout=1.5,
+            )
         except asyncio.TimeoutError:
             self._cancel_thinking_debug()
             if not reply_text.strip():
@@ -1561,25 +1545,6 @@ class RookApp:
             )
 
         self._store_pending_agent_transcript(reply_text)
-
-        if lead_segment_task is not None:
-            lead_segment_ok = await lead_segment_task
-            if not lead_segment_ok:
-                return
-
-            remaining_text = trim_spoken_prefix(reply_text, lead_segment)
-            if remaining_text:
-                if not await self._speak_reply_segment(
-                    remaining_text,
-                    transcript_text=reply_text,
-                    tts_prepare_task=tts_prepare_task,
-                    finalize_after_turn=True,
-                ):
-                    return
-                return
-
-            await self._finalize_voice_turn()
-            return
 
         if not await self._speak_reply_segment(
             reply_text,

@@ -4,18 +4,32 @@ from __future__ import annotations
 import asyncio
 import json
 import platform
+import time
+from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 from uuid import uuid4
 
 import websockets
 from websockets.client import WebSocketClientProtocol
 
+from rook.adapters.openclaw.device_auth import (
+    build_device_auth_payload,
+    clear_device_auth_token,
+    load_device_auth_token,
+    load_or_create_device_identity,
+    public_key_raw_base64url_from_pem,
+    sign_device_payload,
+    store_device_auth_token,
+)
 from rook.adapters.openclaw.models import GatewayEnvelope
 from rook.core.config import Config
 from rook.utils.exceptions import OpenClawError, ConnectionError as RookConnectionError
 from rook.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+OPENCLAW_OPERATOR_ROLE = "operator"
+OPENCLAW_OPERATOR_SCOPES = ["operator.read", "operator.write"]
 
 
 class OpenClawClient:
@@ -30,6 +44,9 @@ class OpenClawClient:
         self._pending_replies: dict[str, asyncio.Future] = {}
         self._session_key: Optional[str] = None
         self._stream_taps: set[asyncio.Queue[GatewayEnvelope]] = set()
+        self._state_dir = self.config.log_file.parent / "openclaw"
+        self._device_identity_path = self._state_dir / "identity" / "device.json"
+        self._device_auth_path = self._state_dir / "identity" / "device-auth.json"
 
     async def connect(self) -> None:
         """Open the websocket and authenticate with a `connect` message."""
@@ -40,17 +57,71 @@ class OpenClawClient:
             return
 
         logger.info("Connecting to OpenClaw gateway at %s", self.config.openclaw_ws_url)
+        identity = load_or_create_device_identity(self._device_identity_path)
+        cached_device_token = load_device_auth_token(
+            self._device_auth_path,
+            device_id=identity.device_id,
+            role=OPENCLAW_OPERATOR_ROLE,
+        )
+        attempts: list[tuple[str, str]] = []
+        if cached_device_token is not None:
+            attempts.append(("device token", cached_device_token.token))
+        if not attempts or cached_device_token.token != self.config.openclaw_api_key:
+            attempts.append(("shared token", self.config.openclaw_api_key))
+
+        last_error: Optional[Exception] = None
+        for label, auth_token in attempts:
+            try:
+                await self._connect_once(auth_token=auth_token, identity_path=self._device_identity_path)
+                return
+            except Exception as exc:
+                last_error = exc
+                await self.disconnect()
+                if label == "device token":
+                    clear_device_auth_token(
+                        self._device_auth_path,
+                        device_id=identity.device_id,
+                        role=OPENCLAW_OPERATOR_ROLE,
+                    )
+                    logger.warning("Stored OpenClaw device token failed; retrying with shared token")
+                    continue
+                break
+
+        assert last_error is not None
+        logger.error("Failed to connect to OpenClaw: %s", last_error)
+        raise RookConnectionError(f"Connection failed: {last_error}") from last_error
+
+    async def _connect_once(self, *, auth_token: str, identity_path: Path) -> None:
+        """Attempt a single websocket connect using either a device token or shared token."""
+        identity = load_or_create_device_identity(identity_path)
+
         try:
             self._ws = await websockets.connect(self.config.openclaw_ws_url)
 
             raw_challenge = await asyncio.wait_for(self._ws.recv(), timeout=5)
             challenge = GatewayEnvelope.model_validate(json.loads(raw_challenge))
+            nonce: Optional[str] = None
             if challenge.type == "event" and challenge.event == "connect.challenge":
+                payload = challenge.payload()
+                nonce_value = payload.get("nonce")
+                if isinstance(nonce_value, str) and nonce_value.strip():
+                    nonce = nonce_value
                 logger.info("Received OpenClaw connect challenge")
             else:
                 logger.warning("Unexpected first OpenClaw frame: %s", challenge.kind)
 
             self._reader_task = asyncio.create_task(self._reader_loop())
+            signed_at_ms = int(time.time() * 1000)
+            connect_payload = build_device_auth_payload(
+                device_id=identity.device_id,
+                client_id="cli",
+                client_mode="cli",
+                role=OPENCLAW_OPERATOR_ROLE,
+                scopes=OPENCLAW_OPERATOR_SCOPES,
+                signed_at_ms=signed_at_ms,
+                token=auth_token,
+                nonce=nonce,
+            )
 
             connect_reply = await self._send_request(
                 "connect",
@@ -63,10 +134,17 @@ class OpenClawClient:
                         "platform": self._platform_name(),
                         "mode": "cli",
                     },
-                    "role": "operator",
-                    "scopes": ["operator.read", "operator.write"],
+                    "role": OPENCLAW_OPERATOR_ROLE,
+                    "scopes": OPENCLAW_OPERATOR_SCOPES,
                     "caps": [],
-                    "auth": {"token": self.config.openclaw_api_key},
+                    "auth": {"token": auth_token},
+                    "device": {
+                        "id": identity.device_id,
+                        "publicKey": public_key_raw_base64url_from_pem(identity.public_key_pem),
+                        "signature": sign_device_payload(identity.private_key_pem, connect_payload),
+                        "signedAt": signed_at_ms,
+                        "nonce": nonce,
+                    },
                     "userAgent": "rook-agent/0.1.0",
                     "locale": "en-US",
                 },
@@ -83,15 +161,29 @@ class OpenClawClient:
                 .get("sessionDefaults", {})
                 .get("mainSessionKey")
             )
+            auth_info = hello.get("auth")
+            granted_scopes: list[str] = OPENCLAW_OPERATOR_SCOPES
+            if isinstance(auth_info, dict):
+                scopes = auth_info.get("scopes")
+                if isinstance(scopes, list):
+                    granted_scopes = [scope for scope in scopes if isinstance(scope, str)]
+                device_token = auth_info.get("deviceToken")
+                if isinstance(device_token, str) and device_token:
+                    store_device_auth_token(
+                        self._device_auth_path,
+                        device_id=identity.device_id,
+                        role=auth_info.get("role") or OPENCLAW_OPERATOR_ROLE,
+                        token=device_token,
+                        scopes=granted_scopes,
+                    )
             self._connected = True
             logger.info(
-                "Connected to OpenClaw gateway (session=%s)",
+                "Connected to OpenClaw gateway (session=%s, scopes=%s)",
                 self._session_key or "unknown",
+                ",".join(granted_scopes) or "none",
             )
-        except Exception as exc:
-            await self.disconnect()
-            logger.error("Failed to connect to OpenClaw: %s", exc)
-            raise RookConnectionError(f"Connection failed: {exc}") from exc
+        except Exception:
+            raise
 
     async def disconnect(self) -> None:
         """Close the websocket and background reader."""
@@ -399,14 +491,42 @@ class OpenClawClient:
 
     def _merge_text(self, existing: str, incoming: str) -> str:
         """Merge streamed text conservatively to avoid obvious duplication."""
-        if not incoming:
+        incoming = incoming.rstrip("\n")
+        stripped = incoming.strip()
+        if not stripped:
             return existing
         if not existing:
-            return incoming
-        if incoming.startswith(existing):
-            return incoming
-        if existing.startswith(incoming) or incoming in existing:
+            return self._normalize_text(stripped)
+        if stripped.startswith(existing):
+            return self._normalize_text(stripped)
+        if existing.startswith(stripped) or stripped in existing:
             return existing
-        if not existing.endswith(" ") and not incoming.startswith((" ", ".", ",", "!", "?", ";", ":")):
-            return f"{existing} {incoming}".strip()
-        return f"{existing}{incoming}".strip()
+        overlap = self._find_overlap(existing, stripped)
+        if overlap:
+            return self._normalize_text(f"{existing}{stripped[overlap:]}")
+        if incoming[:1].isspace():
+            merged = f"{existing} {stripped}"
+        elif stripped.startswith(("-", "'", "’")):
+            merged = f"{existing}{stripped}"
+        elif stripped.startswith((".", ",", "!", "?", ";", ":", ")", "]")):
+            merged = f"{existing}{stripped}"
+        elif existing[-1:].isalnum() and stripped[:1].isalnum():
+            merged = f"{existing}{stripped}"
+        else:
+            merged = f"{existing} {stripped}"
+        return self._normalize_text(merged)
+
+    def _find_overlap(self, existing: str, incoming: str) -> int:
+        """Return the largest safe suffix/prefix overlap between chunks."""
+        max_overlap = min(len(existing), len(incoming))
+        for size in range(max_overlap, 2, -1):
+            if existing.endswith(incoming[:size]):
+                return size
+        return 0
+
+    def _normalize_text(self, text: str) -> str:
+        """Normalize whitespace after merging streamed chunks."""
+        text = " ".join(text.split())
+        for punctuation in (".", ",", "!", "?", ";", ":"):
+            text = text.replace(f" {punctuation}", punctuation)
+        return text.strip()

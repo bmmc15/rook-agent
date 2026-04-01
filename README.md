@@ -86,6 +86,7 @@ For autonomous coding task delegation:
    ```
    OPENCLAW_WS_URL=wss://your-vps.com/ws
    OPENCLAW_API_KEY=your_bearer_token
+   GEMINI_VOICE_NAME=Kore
    ```
 3. Use `/code "your task description"` to delegate tasks
 
@@ -186,6 +187,7 @@ UI_ORB_COLOR=red             # Orb color
 VOICE_ACTIVATION_KEY=space   # Key to trigger voice input
 BARGE_IN_THRESHOLD=0.3       # Interrupt sensitivity (0-1)
 VOICE_TIMEOUT_SECONDS=5      # Max recording duration
+GEMINI_VOICE_NAME=Kore       # Keep the same Gemini voice for all replies
 ```
 
 ### Logging

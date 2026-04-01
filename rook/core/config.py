@@ -29,6 +29,10 @@ class Config(BaseSettings):
         default=Path("./prompts/gemini_session.md"),
         description="Markdown file with persistent Gemini session instructions",
     )
+    gemini_voice_name: str = Field(
+        default="Kore",
+        description="Prebuilt Gemini voice name used for assistant speech",
+    )
 
     # OpenClaw Configuration
     openclaw_ws_url: str = Field(
