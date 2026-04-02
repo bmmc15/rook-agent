@@ -57,3 +57,14 @@ uv.lock
 
 # Claude
 .claude/
+
+# macOS / Swift
+macos/RookMenuBar/.build/
+macos/RookMenuBar/*.xcodeproj/
+macos/RookMenuBar/*.xcworkspace/
+macos/RookMenuBar/DerivedData/
+macos/RookMenuBar/*.resolved
+macos/RookMenuBar/.swiftpm/
+
+# Demo
+demo-vault/
