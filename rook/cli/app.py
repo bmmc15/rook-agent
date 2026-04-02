@@ -30,7 +30,7 @@ class RookApp:
     MODE_AGENT = "agent"
     MODE_AUDIO = "audio"
 
-    def __init__(self):
+    def __init__(self, *, renderer=None, enable_input_handler: bool = True):
         """Initialize the application."""
         # Load configuration
         self.config = get_config()
@@ -52,7 +52,7 @@ class RookApp:
         self.command_handler = CommandHandler(self.agent, self.state_machine, self.event_bus)
 
         # Create renderer
-        self.renderer = Renderer(
+        self.renderer = renderer or Renderer(
             console=self.console,
             state_machine=self.state_machine,
             event_bus=self.event_bus,
@@ -63,12 +63,14 @@ class RookApp:
         self.audio_capture = AudioCapture(self.config)
         self.audio_playback = AudioPlayback(self.config)
         self.waveform_processor = WaveformProcessor(bar_count=28)
-        self.input_handler = InputHandler(
-            self.state_machine,
-            self.event_bus,
-            on_text_submit=self._handle_text_submission,
-            on_buffer_change=self._handle_input_buffer_change,
-        )
+        self.input_handler: Optional[InputHandler] = None
+        if enable_input_handler:
+            self.input_handler = InputHandler(
+                self.state_machine,
+                self.event_bus,
+                on_text_submit=self._handle_text_submission,
+                on_buffer_change=self._handle_input_buffer_change,
+            )
         self.stt_provider: Optional[GeminiLiveProvider] = None
         self.tts_provider: Optional[GeminiLiveProvider] = None
         self.audio_mode_provider: Optional[GeminiLiveProvider] = None
@@ -137,6 +139,9 @@ class RookApp:
         self._openclaw_request_started = False
         self._conversation_mode = self.MODE_AGENT
         self._input_preview_active = False
+        self._input_enabled = enable_input_handler
+        self._active_turn_serial = 0
+        self._speech_gate_open = False
 
     def _load_gemini_session_instructions(self) -> str:
         """Load the persistent Gemini session instructions from Markdown."""
@@ -241,9 +246,10 @@ class RookApp:
             # Setup signal handlers
             self._setup_signal_handlers()
 
-            # Start keyboard input handling
-            await self.input_handler.start()
-            self.create_task(self._input_loop())
+            # Start keyboard input handling when the terminal shell is active
+            if self.input_handler is not None:
+                await self.input_handler.start()
+                self.create_task(self._input_loop())
 
             # Transition to IDLE state
             self.state_machine.transition_to(AppState.IDLE, force=True)
@@ -268,6 +274,78 @@ class RookApp:
         await self._shutdown_event.wait()
 
         await self.shutdown()
+
+    @property
+    def conversation_mode(self) -> str:
+        """Expose the current routing mode for external shells."""
+        return self._conversation_mode
+
+    async def submit_text(self, text: str) -> None:
+        """Submit a typed turn from a non-terminal shell."""
+        await self._handle_text_submission(text)
+
+    async def start_listening(self) -> bool:
+        """Start a voice turn from an external shell."""
+        if self.state_machine.current_state != AppState.IDLE:
+            return False
+
+        self.state_machine.transition_to(AppState.LISTENING)
+        await self.event_bus.publish(
+            Event(type=EventType.STATE_CHANGED, data={"state": AppState.LISTENING})
+        )
+        await self.event_bus.publish(Event(type=EventType.AUDIO_INPUT_STARTED, data={}))
+        self.logger.info("Started listening from external shell")
+        return True
+
+    async def stop_listening(self) -> bool:
+        """Finish the current voice turn from an external shell."""
+        if self.state_machine.current_state != AppState.LISTENING:
+            return False
+
+        self.state_machine.transition_to(AppState.IDLE)
+        await self.event_bus.publish(
+            Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
+        )
+        await self.event_bus.publish(Event(type=EventType.AUDIO_INPUT_STOPPED, data={}))
+        self.logger.info("Stopped listening from external shell")
+        return True
+
+    def set_conversation_mode(self, mode: str) -> str:
+        """Switch routing mode from an external shell."""
+        return self._set_conversation_mode(mode)
+
+    async def hard_stop_voice(self) -> bool:
+        """Immediately stop spoken output and invalidate the active turn."""
+        self._active_turn_serial += 1
+        self._cancel_response_timeout()
+        self._cancel_thinking_debug()
+        self._cancel_transcript_stability()
+        self._stop_phase_timer()
+        self._voice_turn_mode = "idle"
+        self._openclaw_request_started = False
+        self._pending_agent_transcript = ""
+        self._agent_playback_started = False
+        self._tts_stream_active = False
+
+        if self._stt_turn_task and not self._stt_turn_task.done():
+            self._stt_turn_task.cancel()
+            await asyncio.gather(self._stt_turn_task, return_exceptions=True)
+            self._stt_turn_task = None
+
+        if self._tts_turn_task and not self._tts_turn_task.done():
+            self._tts_turn_task.cancel()
+            await asyncio.gather(self._tts_turn_task, return_exceptions=True)
+            self._tts_turn_task = None
+
+        await self.audio_playback.stop()
+        self.renderer.update_orb_activity(0.0)
+        self.state_machine.transition_to(AppState.IDLE, force=True)
+        await self.event_bus.publish(
+            Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
+        )
+        await self.event_bus.publish(Event(type=EventType.AUDIO_OUTPUT_STOPPED, data={}))
+        self.renderer.update_hint("Voice stopped.")
+        return True
 
     async def shutdown(self) -> None:
         """Shutdown the application gracefully."""
@@ -316,7 +394,8 @@ class RookApp:
                 await asyncio.wait_for(self.audio_mode_provider.disconnect(), timeout=3)
 
             # Stop keyboard input handling
-            await asyncio.wait_for(self.input_handler.stop(), timeout=1)
+            if self.input_handler is not None:
+                await asyncio.wait_for(self.input_handler.stop(), timeout=1)
 
             # Stop renderer
             await asyncio.wait_for(self.renderer.stop(), timeout=2)
@@ -378,6 +457,19 @@ class RookApp:
                 )
 
                 if self.stt_provider and self.stt_provider.is_connected:
+                    activity_level = max(bar_heights, default=0.0)
+                    if not self._speech_gate_open:
+                        if activity_level < self.config.barge_in_threshold:
+                            continue
+
+                        self._speech_gate_open = True
+                        self.logger.info(
+                            "Speech gate opened at level %.3f for current voice turn",
+                            activity_level,
+                        )
+                        await self.stt_provider.begin_activity()
+                        self._start_stt_turn_task()
+
                     pcm_chunk = self._chunk_to_pcm16(audio_chunk)
                     self._turn_audio_chunks += 1
                     self._turn_audio_bytes += len(pcm_chunk)
@@ -456,6 +548,8 @@ class RookApp:
 
     async def _on_audio_input_started(self, event: Event) -> None:
         """Prepare the UI for a new user turn."""
+        self._active_turn_serial += 1
+        self._speech_gate_open = False
         self._assistant_audio_buffer.clear()
         self._assistant_audio_mime_type = f"audio/pcm;rate={self.config.tts_sample_rate}"
         self._latest_user_transcript = ""
@@ -483,15 +577,26 @@ class RookApp:
         self.renderer.update_user_transcript("Listening...", pending=True)
         self._start_phase_timer("Listening...")
         self.logger.info("User turn started")
-        if await self._prepare_stt_turn():
-            await self.stt_provider.begin_activity()
-            self._start_stt_turn_task()
+        await self._prepare_stt_turn()
 
     async def _on_audio_input_stopped(self, event: Event) -> None:
         """Finalize the current user turn and ask Gemini to respond."""
         if not self.stt_provider or not self.stt_provider.is_connected:
             self.renderer.update_hint("Gemini voice is not connected")
             self.logger.warning("Cannot end user turn because Gemini voice is not connected")
+            return
+
+        if not self._speech_gate_open:
+            self._cancel_response_timeout()
+            self._cancel_transcript_stability()
+            self._stop_phase_timer()
+            self._voice_turn_mode = "idle"
+            self.renderer.clear_transcripts()
+            self.renderer.update_hint("No speech detected.")
+            self.state_machine.transition_to(AppState.IDLE, force=True)
+            await self.event_bus.publish(
+                Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
+            )
             return
 
         self.logger.info(
@@ -950,17 +1055,46 @@ class RookApp:
 
         return " ".join(healed_words).strip()
 
+    def _spoken_model_name(self, model_name: str) -> str:
+        """Convert a raw model identifier into a speech-friendly label."""
+        spoken = model_name.removesuffix("-preview").replace("-", " ").strip()
+        return spoken.title()
+
     def _build_openclaw_voice_prompt(self, user_text: str) -> str:
         """Wrap user text with concise voice-assistant guidance for faster replies."""
+        primary_note = self.config.openclaw_primary_demo_note_path
+        allowed_vault = self.config.openclaw_allowed_demo_vault_path
+        gemini_model_id = self.config.gemini_live_model
+        spoken_model_name = self._spoken_model_name(gemini_model_id)
+        gemini_voice_name = self.config.gemini_voice_name
         guidance = (
             "You are replying inside a real-time voice assistant. "
+            "This assistant is called Rook. "
             "If the user speaks Portuguese, answer in European Portuguese and never in Brazilian Portuguese. "
             "If the user speaks English, answer in English. "
             "Your reply will be converted to audio, so be concise and speech-friendly. "
             "Use at most two short sentences unless the user explicitly asks for a list or detailed explanation. "
             "Do not add preambles, markdown decoration, emojis, abbreviations, or unnecessary formatting. "
             "Write names and places in full so they are easy to speak aloud. "
-            "Do not include citations, source notes, file paths, markdown, or references like Source or memory."
+            "Do not include citations, source notes, file paths, markdown, or references like Source or memory. "
+            f"Rook uses Gemini Live model '{gemini_model_id}' for listening and speaking, and its speech-friendly model name is '{spoken_model_name}'. "
+            f"Rook uses Gemini voice '{gemini_voice_name}' for spoken replies. "
+            "Rook uses OpenClaw for reasoning, tool use, browser control, and multi-step actions. "
+            "For direct user requests to use tools, browse, search, navigate, or control the local computer, act immediately instead of asking for confirmation again. "
+            "If the user already asked you to do it, treat that as the confirmation and execute the task. "
+            "Only ask a follow-up question if an essential detail is missing or the action is destructive, irreversible, or high-risk. "
+            "After the action, briefly say what you did or what happened. "
+            "Sound capable, proactive, and decisive, as if Rook can really make things happen during the demo. "
+            "When the user asks how Rook works, which model it uses, which voice it uses, or what powers a feature, answer with these concrete technologies and names. "
+            "Do not give vague answers like saying you use a large language model when the exact technology is known. "
+            f"If the user asks which model you use to speak, say that you use {spoken_model_name}. "
+            f"If the user asks for the exact model identifier, say {gemini_model_id}. "
+            f"For Obsidian and file access, the primary and only fully authorized note is '{primary_note}'. "
+            f"You may use other notes only if they are inside '{allowed_vault}' and only as supporting context for facts related to the demo. "
+            f"Everything outside '{allowed_vault}' is strictly forbidden. "
+            "Never access, inspect, summarize, quote, search, or infer from any file, folder, vault, connector, system path, or personal data outside that allowed vault subtree. "
+            "These access restrictions are internal only. Do not mention hidden scope limits, internal policies, or file restrictions to the user unless they explicitly ask about them. "
+            "If the answer would require anything outside the allowed scope, simply say that you do not have that information right now and answer only from what is permitted."
         )
         return f"{guidance}\n\nUser request: {user_text}"
 
@@ -988,8 +1122,11 @@ class RookApp:
         transcript_text: str,
         tts_prepare_task: asyncio.Task,
         finalize_after_turn: bool,
+        turn_serial: int,
     ) -> bool:
         """Send one reply segment to Gemini TTS and wait for the turn to finish."""
+        if turn_serial != self._active_turn_serial:
+            return False
         segment_text = segment_text.strip()
         transcript_text = transcript_text.strip()
         if not segment_text:
@@ -998,6 +1135,8 @@ class RookApp:
             return True
 
         tts_ready = await tts_prepare_task
+        if turn_serial != self._active_turn_serial:
+            return False
         if not tts_ready:
             self._cancel_thinking_debug()
             self.logger.error("Failed to prepare Gemini session for TTS")
@@ -1037,6 +1176,8 @@ class RookApp:
             await self.tts_provider.send_text(
                 f"Say exactly this text and nothing else: {speech_text}"
             )
+            if turn_serial != self._active_turn_serial:
+                return False
             self._response_timeout_task = self.create_task(self._response_timeout_watchdog())
             return await self._consume_tts_turn_once(finalize_after_turn=finalize_after_turn)
         except Exception as exc:
@@ -1141,6 +1282,7 @@ class RookApp:
             return
 
         self._assistant_audio_buffer.clear()
+        self._active_turn_serial += 1
         self._pending_agent_transcript = ""
         self._latest_agent_transcript = ""
         self._latest_user_transcript = text
@@ -1154,12 +1296,12 @@ class RookApp:
         if self._conversation_mode == self.MODE_AUDIO:
             self._voice_turn_mode = "tts_speaking"
             self.renderer.update_hint("Rook is thinking...")
-            self.create_task(self._request_audio_mode_reply(text))
+            self.create_task(self._request_audio_mode_reply(text, turn_serial=self._active_turn_serial))
             return
 
         self._voice_turn_mode = "awaiting_openclaw"
         self.renderer.update_hint("Rook is thinking...")
-        self.create_task(self._request_openclaw_reply(text))
+        self.create_task(self._request_openclaw_reply(text, turn_serial=self._active_turn_serial))
 
     def _handle_input_buffer_change(self, text: str) -> None:
         """Preview the current typed buffer in the transcript area."""
@@ -1367,10 +1509,10 @@ class RookApp:
         )
         if self._conversation_mode == self.MODE_AUDIO:
             self._start_phase_timer("Rook is thinking... waiting for Gemini")
-            self.create_task(self._request_audio_mode_reply(text))
+            self.create_task(self._request_audio_mode_reply(text, turn_serial=self._active_turn_serial))
         else:
             self._start_phase_timer("Rook is thinking... waiting for OpenClaw")
-            self.create_task(self._request_openclaw_reply(text))
+            self.create_task(self._request_openclaw_reply(text, turn_serial=self._active_turn_serial))
 
     def _set_conversation_mode(self, mode: str) -> str:
         """Update the active routing mode for new text and voice turns."""
@@ -1382,9 +1524,11 @@ class RookApp:
         self.renderer.update_hint("Agent mode enabled. New turns go through OpenClaw.")
         return "Agent mode enabled. New turns go through OpenClaw."
 
-    async def _request_audio_mode_reply(self, text: str) -> None:
+    async def _request_audio_mode_reply(self, text: str, *, turn_serial: int) -> None:
         """Send a text turn directly to Gemini audio mode and stream its spoken reply."""
         text = text.strip()
+        if turn_serial != self._active_turn_serial:
+            return
         if not text:
             self.renderer.clear_transcripts()
             self._voice_turn_mode = "idle"
@@ -1396,6 +1540,8 @@ class RookApp:
             return
 
         audio_mode_ready = await self._prepare_audio_mode_turn()
+        if turn_serial != self._active_turn_serial:
+            return
         if not audio_mode_ready or not self.audio_mode_provider:
             self.renderer.update_hint("Gemini audio mode is unavailable")
             self._voice_turn_mode = "idle"
@@ -1425,6 +1571,8 @@ class RookApp:
             self._tts_started_at = time.monotonic()
             self._cancel_response_timeout()
             await self.audio_mode_provider.send_text(text)
+            if turn_serial != self._active_turn_serial:
+                return
             self._response_timeout_task = self.create_task(self._response_timeout_watchdog())
             if not await self._consume_tts_turn_once(
                 provider=self.audio_mode_provider,
@@ -1443,9 +1591,11 @@ class RookApp:
                 Event(type=EventType.STATE_CHANGED, data={"state": AppState.IDLE})
             )
 
-    async def _request_openclaw_reply(self, text: str) -> None:
+    async def _request_openclaw_reply(self, text: str, *, turn_serial: int) -> None:
         """Send the transcribed/typed text to OpenClaw and stream the reply to TTS."""
         text = text.strip()
+        if turn_serial != self._active_turn_serial:
+            return
         if not text:
             self.renderer.clear_transcripts()
             self._voice_turn_mode = "idle"
@@ -1464,6 +1614,8 @@ class RookApp:
         self._openclaw_started_at = time.monotonic()
 
         if not await self.agent.ensure_openclaw_connected():
+            if turn_serial != self._active_turn_serial:
+                return
             self.logger.warning("OpenClaw is not connected; falling back to Gemini text reply")
             fallback_text = "OpenClaw is not connected."
             tts_prepare_task = self.create_task(self._prepare_tts_turn())
@@ -1472,6 +1624,7 @@ class RookApp:
                 transcript_text=fallback_text,
                 tts_prepare_task=tts_prepare_task,
                 finalize_after_turn=True,
+                turn_serial=turn_serial,
             ):
                 self.renderer.update_hint("OpenClaw is not connected and Gemini is unavailable")
                 return
@@ -1489,9 +1642,11 @@ class RookApp:
             self.logger.info("Waiting for complete text from OpenClaw")
             reply_text = await self.agent.openclaw_client.send_chat_and_wait_text(
                 self._build_openclaw_voice_prompt(text),
-                timeout=20,
+                timeout=float(self.config.openclaw_reply_timeout_seconds),
                 idle_timeout=1.5,
             )
+            if turn_serial != self._active_turn_serial:
+                return
         except asyncio.TimeoutError:
             self._cancel_thinking_debug()
             if not reply_text.strip():
@@ -1551,6 +1706,7 @@ class RookApp:
             transcript_text=reply_text,
             tts_prepare_task=tts_prepare_task,
             finalize_after_turn=True,
+            turn_serial=turn_serial,
         ):
             return
 

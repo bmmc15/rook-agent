@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import json
 import platform
 import time
@@ -30,6 +31,14 @@ logger = get_logger(__name__)
 
 OPENCLAW_OPERATOR_ROLE = "operator"
 OPENCLAW_OPERATOR_SCOPES = ["operator.read", "operator.write"]
+
+
+@dataclass(frozen=True)
+class _OpenClawTextFragment:
+    """A single assistant text fragment plus its semantic phase, when known."""
+
+    text: str
+    phase: Optional[str] = None
 
 
 class OpenClawClient:
@@ -258,7 +267,8 @@ class OpenClawClient:
 
         tap: asyncio.Queue[GatewayEnvelope] = asyncio.Queue()
         self._stream_taps.add(tap)
-        assembled = ""
+        commentary_text = ""
+        final_text = ""
 
         try:
             loop = asyncio.get_running_loop()
@@ -268,27 +278,41 @@ class OpenClawClient:
             while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    if assembled:
+                    best_text = final_text or commentary_text
+                    if best_text:
                         logger.warning(
-                            "Returning partial OpenClaw reply after overall timeout (run_id=%s)",
+                            "Returning OpenClaw %s reply after overall timeout (run_id=%s)",
+                            "final" if final_text else "partial",
                             run_id,
                         )
-                        return assembled
+                        return best_text
                     raise OpenClawError("Timed out waiting for OpenClaw streamed reply")
 
-                if assembled and last_activity is not None:
-                    remaining = min(remaining, max(0.1, idle_timeout - (loop.time() - last_activity)))
+                waiting_for_final_inactivity = False
+                if final_text and last_activity is not None:
+                    inactivity_remaining = max(0.1, idle_timeout - (loop.time() - last_activity))
+                    if inactivity_remaining < remaining:
+                        remaining = inactivity_remaining
+                        waiting_for_final_inactivity = True
 
                 try:
                     envelope = await asyncio.wait_for(tap.get(), timeout=remaining)
                 except asyncio.TimeoutError as exc:
-                    if assembled:
+                    if waiting_for_final_inactivity and final_text:
                         logger.info(
-                            "Returning OpenClaw reply after %.1fs of stream inactivity (run_id=%s)",
+                            "Returning OpenClaw final reply after %.1fs of stream inactivity (run_id=%s)",
                             idle_timeout,
                             run_id,
                         )
-                        return assembled
+                        return final_text
+                    best_text = final_text or commentary_text
+                    if best_text:
+                        logger.warning(
+                            "Returning OpenClaw %s reply after overall timeout (run_id=%s)",
+                            "final" if final_text else "partial",
+                            run_id,
+                        )
+                        return best_text
                     raise OpenClawError("Timed out waiting for OpenClaw streamed reply") from exc
                 payload = envelope.payload()
                 if payload.get("runId") != run_id:
@@ -302,35 +326,48 @@ class OpenClawClient:
                     run_id,
                 )
 
-                text = self._extract_text(payload)
-                if text:
-                    assembled = self._merge_text(assembled, text)
+                for fragment in self._extract_text_fragments(payload):
+                    bucket = final_text if fragment.phase == "final_answer" else commentary_text
+                    merged = self._merge_text(bucket, fragment.text)
+                    if fragment.phase == "final_answer":
+                        final_text = merged
+                    else:
+                        commentary_text = merged
                     last_activity = loop.time()
                     logger.debug(
-                        "OpenClaw assembled reply update (run_id=%s, chunk_chars=%s, total_chars=%s): %r",
+                        "OpenClaw assembled %s update (run_id=%s, chunk_chars=%s, total_chars=%s): %r",
+                        fragment.phase or "unclassified",
                         run_id,
-                        len(text),
-                        len(assembled),
-                        assembled[:200],
+                        len(fragment.text),
+                        len(merged),
+                        merged[:200],
                     )
 
+                best_text = final_text or commentary_text
+
                 if envelope.kind.startswith("chat") and payload.get("state") == "final":
+                    if not best_text:
+                        logger.debug(
+                            "Ignoring empty OpenClaw final chat event while waiting for assistant text (run_id=%s)",
+                            run_id,
+                        )
+                        continue
                     logger.info(
                         "OpenClaw returning final chat reply (run_id=%s, chars=%s)",
                         run_id,
-                        len(assembled or text or ""),
+                        len(best_text),
                     )
-                    return assembled or text
+                    return best_text
 
                 if envelope.kind.startswith("agent"):
                     data = payload.get("data")
-                    if isinstance(data, dict) and data.get("phase") == "end" and assembled:
+                    if isinstance(data, dict) and data.get("phase") == "end" and best_text:
                         logger.info(
                             "OpenClaw returning reply on agent phase=end (run_id=%s, chars=%s)",
                             run_id,
-                            len(assembled),
+                            len(best_text),
                         )
-                        return assembled
+                        return best_text
         finally:
             self._stream_taps.discard(tap)
 
@@ -382,6 +419,8 @@ class OpenClawClient:
                         last_activity = loop.time()
 
                 if envelope.kind.startswith("chat") and payload.get("state") == "final":
+                    if not prev_assembled:
+                        continue
                     return
 
                 if envelope.kind.startswith("agent"):
@@ -462,32 +501,103 @@ class OpenClawClient:
 
     def _extract_text(self, payload: dict[str, Any]) -> str:
         """Flatten common streamed payloads into plain text."""
-        direct_text = payload.get("content") or payload.get("text") or payload.get("delta")
-        if isinstance(direct_text, str):
-            return direct_text.strip()
+        fragments = self._extract_text_fragments(payload)
+        return " ".join(fragment.text for fragment in fragments if fragment.text).strip()
+
+    def _extract_text_fragments(self, payload: dict[str, Any]) -> list[_OpenClawTextFragment]:
+        """Extract assistant text fragments and preserve their semantic phase."""
+        payload_phase = self._extract_payload_text_phase(payload)
+        message = payload.get("message")
+
+        if isinstance(message, dict):
+            role = message.get("role")
+            if isinstance(role, str) and role and role != "assistant":
+                return []
+
+            content = message.get("content")
+            if isinstance(content, list):
+                fragments: list[_OpenClawTextFragment] = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = item.get("type")
+                    if isinstance(item_type, str) and item_type != "text":
+                        continue
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        fragments.append(
+                            _OpenClawTextFragment(
+                                text=text.strip(),
+                                phase=self._extract_item_text_phase(item) or payload_phase,
+                            )
+                        )
+                if fragments:
+                    return fragments
+
+        if isinstance(message, str) and message.strip():
+            return [_OpenClawTextFragment(text=message.strip(), phase=payload_phase)]
 
         data = payload.get("data")
         if isinstance(data, dict):
             for key in ("text", "delta", "message"):
                 value = data.get(key)
-                if isinstance(value, str):
-                    return value.strip()
+                if isinstance(value, str) and value.strip():
+                    return [_OpenClawTextFragment(text=value.strip(), phase=payload_phase)]
+
+        direct_text = payload.get("content") or payload.get("text") or payload.get("delta")
+        if isinstance(direct_text, str) and direct_text.strip():
+            return [_OpenClawTextFragment(text=direct_text.strip(), phase=payload_phase)]
+
+        return []
+
+    def _extract_item_text_phase(self, item: dict[str, Any]) -> Optional[str]:
+        """Extract the semantic phase embedded in an OpenClaw text item."""
+        phase = item.get("phase")
+        if isinstance(phase, str) and phase.strip():
+            return phase
+
+        signature = item.get("textSignature")
+        if not isinstance(signature, str) or not signature.strip():
+            return None
+
+        try:
+            parsed = json.loads(signature)
+        except json.JSONDecodeError:
+            return None
+
+        phase = parsed.get("phase")
+        if isinstance(phase, str) and phase.strip():
+            return phase
+        return None
+
+    def _extract_payload_text_phase(self, payload: dict[str, Any]) -> Optional[str]:
+        """Infer whether a payload text belongs to commentary or the final answer."""
+        data = payload.get("data")
+        if isinstance(data, dict):
+            phase = data.get("phase")
+            if isinstance(phase, str) and phase in {"commentary", "final_answer"}:
+                return phase
+
+        state = payload.get("state")
+        if state == "final":
+            return "final_answer"
 
         message = payload.get("message")
-        if isinstance(message, str):
-            return message.strip()
+        stop_reason: Optional[str] = None
         if isinstance(message, dict):
-            content = message.get("content")
-            if isinstance(content, list):
-                chunks: list[str] = []
-                for item in content:
-                    if isinstance(item, dict):
-                        text = item.get("text")
-                        if isinstance(text, str) and text.strip():
-                            chunks.append(text.strip())
-                return " ".join(chunks)
+            raw_stop_reason = message.get("stopReason")
+            if isinstance(raw_stop_reason, str) and raw_stop_reason.strip():
+                stop_reason = raw_stop_reason
+        if stop_reason is None:
+            raw_stop_reason = payload.get("stopReason")
+            if isinstance(raw_stop_reason, str) and raw_stop_reason.strip():
+                stop_reason = raw_stop_reason
 
-        return ""
+        if stop_reason == "toolUse":
+            return "commentary"
+        if stop_reason == "stop":
+            return "final_answer"
+        return None
 
     def _merge_text(self, existing: str, incoming: str) -> str:
         """Merge streamed text conservatively to avoid obvious duplication."""

@@ -1,10 +1,11 @@
 # Rook Agent
 
-A production-ready terminal voice assistant with HALIST-style UI. Combines text chat and voice interaction, connects to OpenClaw agents, and supports autonomous coding task delegation.
+A production-ready voice assistant with both a Rich terminal UI and a native macOS menu bar shell. Combines text chat and voice interaction, connects to OpenClaw agents, and supports autonomous coding task delegation.
 
 ## Features
 
 - **Rich Terminal UI**: Bordered panel with animated pulsating orb and green audio waveform bars
+- **macOS Menu Bar App**: Native SwiftUI shell with animated state orb, transcript, and push-to-talk mic control
 - **Voice Interaction**: Push-to-talk with Google Gemini Live API for STT+TTS
 - **Text REPL**: Full command system for control and task management
 - **OpenClaw Integration**: WebSocket connection to remote AI coding agents
@@ -43,12 +44,20 @@ uv sync
 ## Quick Start
 
 ```bash
-# Start the assistant
+# Start the terminal assistant
 python3 main.py
 
 # You should see the animated orb in a bordered panel
 # Press Ctrl+C to exit
 ```
+
+```bash
+# Start the macOS menu bar app
+cd macos/RookMenuBar
+swift run
+```
+
+The menu bar app launches the same Python runtime through `python -m rook.macos.backend`, so it reuses the existing OpenClaw, Gemini Live, and task orchestration logic.
 
 ## Usage
 
@@ -125,6 +134,8 @@ For autonomous coding task delegation:
 
 ```
 rook-agent/
+├── macos/
+│   └── RookMenuBar/       # Native SwiftUI menu bar shell
 ├── main.py                 # Entry point
 ├── rook/
 │   ├── cli/               # Terminal UI components
@@ -146,6 +157,7 @@ rook-agent/
 │   │   └── message_router.py  # Message routing logic
 │   ├── adapters/         # External service adapters
 │   │   └── openclaw/     # OpenClaw WebSocket client
+│   ├── macos/            # JSON bridge backend for the native shell
 │   ├── tasks/            # Task management
 │   │   ├── manager.py    # Task lifecycle
 │   │   ├── executor.py   # Task execution

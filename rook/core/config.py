@@ -47,6 +47,19 @@ class Config(BaseSettings):
         default="Rook",
         description="Name of the OpenClaw agent",
     )
+    openclaw_reply_timeout_seconds: int = Field(
+        default=75,
+        gt=0,
+        description="Maximum time to wait for a final OpenClaw reply before aborting the turn",
+    )
+    openclaw_primary_demo_note_path: str = Field(
+        default="demo-vault/Rook Agent docs.md",
+        description="Primary Obsidian note that OpenClaw is allowed to rely on during the demo",
+    )
+    openclaw_allowed_demo_vault_path: str = Field(
+        default="demo-vault",
+        description="Only vault subtree that OpenClaw may consult for supporting demo context",
+    )
 
     # Audio Configuration
     audio_sample_rate: int = Field(
